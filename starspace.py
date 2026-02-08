@@ -330,7 +330,7 @@ def _train_step(emb, adagrad,
             for d in range(dim):
                 emb[nl, d] -= eff * lhs_vec[d]
 
-    # norm clipping
+    # norm clipping (all modified rows: LHS, RHS positive, RHS negatives)
     if norm_limit > np.float32(0.0):
         for k in range(n_ctx):
             row = ctx_buf[k]
@@ -352,6 +352,17 @@ def _train_step(emb, adagrad,
                 sc = norm_limit / rn
                 for d in range(dim):
                     emb[tgt, d] *= sc
+        for ni in range(neg_search_limit):
+            if neg_flags[ni] == np.int32(1):
+                nl = neg_ids[ni]
+                rn = np.float32(0.0)
+                for d in range(dim):
+                    rn += emb[nl, d] * emb[nl, d]
+                rn = np.float32(np.sqrt(np.float64(rn)))
+                if rn > norm_limit:
+                    sc = norm_limit / rn
+                    for d in range(dim):
+                        emb[nl, d] *= sc
 
     return loss_sum, rng_state
 

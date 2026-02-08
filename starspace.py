@@ -367,6 +367,27 @@ def _train_step(emb, adagrad,
     return loss_sum, rng_state
 
 
+# ── line offsets (for per-epoch shuffling) ────────────────────────────────────
+
+@njit(cache=True)
+def _find_line_offsets(buf, buf_len):
+    """Pre-scan mmap for line start byte offsets."""
+    if buf_len == 0:
+        return np.empty(0, np.int64)
+    n = np.int64(1)
+    for i in range(buf_len):
+        if buf[i] == 10 and i + 1 < buf_len:
+            n += 1
+    offsets = np.empty(n, np.int64)
+    offsets[0] = np.int64(0)
+    idx = np.int64(1)
+    for i in range(buf_len):
+        if buf[i] == 10 and i + 1 < buf_len:
+            offsets[idx] = np.int64(i + 1)
+            idx += 1
+    return offsets
+
+
 # ── training epoch (retokenises from mmap each pass) ─────────────────────────
 
 @njit(fastmath=True, cache=True)
@@ -375,8 +396,9 @@ def _train_epoch(emb, adagrad, buf, buf_len,
                  table_mask, remap,
                  nwords, nlabels, dim, word_ngrams, bucket,
                  margin, neg_search_limit, base_lr, total_tokens,
-                 rng_state, tok_count, norm_limit, mode, ws):
-    """One training epoch: scan mmap text, tokenise, train inline.
+                 rng_state, tok_count, norm_limit, mode, ws,
+                 line_offsets, n_lines, perm):
+    """One training epoch: shuffle lines, retokenise, train.
 
     Returns (loss_sum, n_steps, tok_count, rng_state).
     """
@@ -406,205 +428,212 @@ def _train_epoch(emb, adagrad, buf, buf_len,
     neg_ids   = np.empty(neg_search_limit, np.int32)
     neg_flags = np.empty(neg_search_limit, np.int32)
 
-    nw_line = np.int32(0)
-    nl_line = np.int32(0)
-    in_token = False
-    tok_start = np.int64(0)
-    pos = np.int64(0)
+    # Fisher-Yates shuffle (matches native C++ random_shuffle per epoch)
+    for i in range(n_lines - 1, 0, -1):
+        rng_state = (rng_state * np.int64(48271)) % np.int64(2147483647)
+        j = np.int64(np.uint64(rng_state) % np.uint64(i + 1))
+        perm[i], perm[j] = perm[j], perm[i]
+
     done = False
 
-    while pos <= buf_len and not done:
-        # At EOF, synthesise a newline to flush the last line
-        if pos < buf_len:
-            b = buf[pos]
-        else:
-            b = np.uint8(10)
+    for li in range(n_lines):
+        if done:
+            break
 
-        is_ws = (b == 32 or b == 9 or b == 13)
-        is_nl = (b == 10)
+        # find line bounds
+        line_start = line_offsets[perm[li]]
+        line_end = line_start
+        while line_end < buf_len and buf[line_end] != np.uint8(10):
+            line_end += 1
 
-        if is_ws or is_nl:
-            # finish current token
-            if in_token:
-                fid, fnv = _lookup_token(
-                    buf, tok_start, pos,
-                    ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
-                    table_mask, remap)
-                if fid >= 0:
-                    if fid < nwords:
-                        if nw_line < MAX_TOK:
-                            line_wids[nw_line] = fid
-                            line_whash[nw_line] = fnv
-                            nw_line += 1
-                    else:
-                        if nl_line < MAX_TOK:
-                            line_lids[nl_line] = fid
-                            nl_line += 1
-                in_token = False
+        # tokenise this line
+        nw_line = np.int32(0)
+        nl_line = np.int32(0)
+        in_token = False
+        tok_start = line_start
+        pos = line_start
 
-            if is_nl:
-                # ── process complete line ──
-                if mode == 5:
-                    # Update progress once per line (matches native C++
-                    # which decays LR per sample/line, not per word-pair)
-                    tok_count += np.int64(nw_line)
-                    progress = np.float64(tok_count) / np.float64(
-                        total_tokens)
-                    cur_lr = np.float32(
-                        np.float64(base_lr) * (1.0 - progress))
-                    if cur_lr <= np.float32(0.0):
-                        done = True
+        while pos <= line_end:
+            if pos < line_end:
+                b = buf[pos]
+            else:
+                b = np.uint8(32)  # virtual space to flush last token
 
-                    if not done and nw_line > 0:
-                        for wi in range(nw_line):
-                            cs = max(np.int32(0), wi - np.int32(ws))
-                            ce = min(nw_line, wi + np.int32(ws) + np.int32(1))
-                            n_ctx_words = np.int32(0)
-                            for ci in range(cs, ce):
-                                if ci != wi:
-                                    ctx_wids_tmp[n_ctx_words] = line_wids[ci]
-                                    ctx_whash_tmp[n_ctx_words] = line_whash[ci]
-                                    n_ctx_words += 1
-                            if n_ctx_words == 0:
-                                continue
-                            n_ctx = _build_word_ctx(
-                                ctx_wids_tmp, ctx_whash_tmp, n_ctx_words,
-                                word_ngrams, bucket, ngram_base, ctx_buf)
-                            target_buf[0] = line_wids[wi]
-                            n_targets = np.int32(1)
-
-                            loss, rng_state = _train_step(
-                                emb, adagrad,
-                                ctx_buf, n_ctx, target_buf, n_targets,
-                                lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
-                                neg_ids, neg_flags,
-                                dim, nwords, nlabels, margin,
-                                neg_search_limit,
-                                cur_lr, rng_state, norm_limit, mode)
-                            loss_sum += loss
-                            n_steps += 1
-
-                else:
-                    # modes 0-4
-                    n_ctx = np.int32(0)
-                    n_targets = np.int32(0)
-                    do_train = False
-
-                    if mode == 0:
-                        if nw_line > 0 and nl_line > 0:
-                            n_ctx = _build_word_ctx(
-                                line_wids, line_whash, nw_line,
-                                word_ngrams, bucket, ngram_base, ctx_buf)
-                            rng_state = (rng_state * np.int64(48271)) % \
-                                np.int64(2147483647)
-                            target_buf[0] = line_lids[np.int32(
-                                np.uint64(rng_state) % np.uint64(nl_line))]
-                            n_targets = np.int32(1)
-                            do_train = True
-
-                    elif mode == 1:
-                        if nw_line > 0 and nl_line >= 2:
-                            rng_state = (rng_state * np.int64(48271)) % \
-                                np.int64(2147483647)
-                            idx = np.int32(
-                                np.uint64(rng_state) % np.uint64(nl_line))
-                            n_ctx = _build_word_ctx(
-                                line_wids, line_whash, nw_line,
-                                word_ngrams, bucket, ngram_base, ctx_buf)
-                            for k in range(nl_line):
-                                if k != idx:
-                                    ctx_buf[n_ctx] = line_lids[k]
-                                    n_ctx += 1
-                            target_buf[0] = line_lids[idx]
-                            n_targets = np.int32(1)
-                            do_train = True
-
-                    elif mode == 2:
-                        if nw_line > 0 and nl_line >= 2:
-                            rng_state = (rng_state * np.int64(48271)) % \
-                                np.int64(2147483647)
-                            idx = np.int32(
-                                np.uint64(rng_state) % np.uint64(nl_line))
-                            n_ctx = _build_word_ctx(
-                                line_wids, line_whash, nw_line,
-                                word_ngrams, bucket, ngram_base, ctx_buf)
-                            ctx_buf[n_ctx] = line_lids[idx]
-                            n_ctx += 1
-                            nt = np.int32(0)
-                            for k in range(nl_line):
-                                if k != idx:
-                                    target_buf[nt] = line_lids[k]
-                                    nt += 1
-                            n_targets = nt
-                            do_train = True
-
-                    elif mode == 3:
-                        if nl_line >= 2:
-                            rng_state = (rng_state * np.int64(48271)) % \
-                                np.int64(2147483647)
-                            i1 = np.int32(
-                                np.uint64(rng_state) % np.uint64(nl_line))
-                            rng_state = (rng_state * np.int64(48271)) % \
-                                np.int64(2147483647)
-                            i2 = np.int32(
-                                np.uint64(rng_state) % np.uint64(nl_line))
-                            while i2 == i1:
-                                rng_state = (rng_state * np.int64(48271)) \
-                                    % np.int64(2147483647)
-                                i2 = np.int32(
-                                    np.uint64(rng_state) % np.uint64(
-                                        nl_line))
-                            n_ctx = _build_word_ctx(
-                                line_wids, line_whash, nw_line,
-                                word_ngrams, bucket, ngram_base, ctx_buf)
-                            ctx_buf[n_ctx] = line_lids[i1]
-                            n_ctx += 1
-                            target_buf[0] = line_lids[i2]
-                            n_targets = np.int32(1)
-                            do_train = True
-
-                    elif mode == 4:
-                        if nl_line >= 2:
-                            n_ctx = _build_word_ctx(
-                                line_wids, line_whash, nw_line,
-                                word_ngrams, bucket, ngram_base, ctx_buf)
-                            ctx_buf[n_ctx] = line_lids[0]
-                            n_ctx += 1
-                            target_buf[0] = line_lids[1]
-                            n_targets = np.int32(1)
-                            do_train = True
-
-                    if do_train:
-                        tok_count += np.int64(nw_line)
-                        progress = np.float64(tok_count) / np.float64(
-                            total_tokens)
-                        cur_lr = np.float32(
-                            np.float64(base_lr) * (1.0 - progress))
-                        if cur_lr <= np.float32(0.0):
-                            done = True
+            if b == 32 or b == 9 or b == 13 or b == 10:
+                if in_token:
+                    fid, fnv = _lookup_token(
+                        buf, tok_start, pos,
+                        ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                        table_mask, remap)
+                    if fid >= 0:
+                        if fid < nwords:
+                            if nw_line < MAX_TOK:
+                                line_wids[nw_line] = fid
+                                line_whash[nw_line] = fnv
+                                nw_line += 1
                         else:
-                            loss, rng_state = _train_step(
-                                emb, adagrad,
-                                ctx_buf, n_ctx, target_buf, n_targets,
-                                lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
-                                neg_ids, neg_flags,
-                                dim, nwords, nlabels, margin,
-                                neg_search_limit,
-                                cur_lr, rng_state, norm_limit, mode)
-                            loss_sum += loss
-                            n_steps += 1
+                            if nl_line < MAX_TOK:
+                                line_lids[nl_line] = fid
+                                nl_line += 1
+                    in_token = False
+                pos += 1
+                continue
 
-                nw_line = np.int32(0)
-                nl_line = np.int32(0)
-
+            if not in_token:
+                tok_start = pos
+                in_token = True
             pos += 1
-            continue
 
-        # regular byte — start or extend a token
-        if not in_token:
-            tok_start = pos
-            in_token = True
-        pos += 1
+        # ── process complete line ──
+        if mode == 5:
+            # Update progress once per line (matches native C++
+            # which decays LR per sample/line, not per word-pair)
+            tok_count += np.int64(nw_line)
+            progress = np.float64(tok_count) / np.float64(
+                total_tokens)
+            cur_lr = np.float32(
+                np.float64(base_lr) * (1.0 - progress))
+            if cur_lr <= np.float32(0.0):
+                done = True
+
+            if not done and nw_line > 0:
+                for wi in range(nw_line):
+                    cs = max(np.int32(0), wi - np.int32(ws))
+                    ce = min(nw_line, wi + np.int32(ws) + np.int32(1))
+                    n_ctx_words = np.int32(0)
+                    for ci in range(cs, ce):
+                        if ci != wi:
+                            ctx_wids_tmp[n_ctx_words] = line_wids[ci]
+                            ctx_whash_tmp[n_ctx_words] = line_whash[ci]
+                            n_ctx_words += 1
+                    if n_ctx_words == 0:
+                        continue
+                    n_ctx = _build_word_ctx(
+                        ctx_wids_tmp, ctx_whash_tmp, n_ctx_words,
+                        word_ngrams, bucket, ngram_base, ctx_buf)
+                    target_buf[0] = line_wids[wi]
+                    n_targets = np.int32(1)
+
+                    loss, rng_state = _train_step(
+                        emb, adagrad,
+                        ctx_buf, n_ctx, target_buf, n_targets,
+                        lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
+                        neg_ids, neg_flags,
+                        dim, nwords, nlabels, margin,
+                        neg_search_limit,
+                        cur_lr, rng_state, norm_limit, mode)
+                    loss_sum += loss
+                    n_steps += 1
+
+        else:
+            # modes 0-4
+            n_ctx = np.int32(0)
+            n_targets = np.int32(0)
+            do_train = False
+
+            if mode == 0:
+                if nw_line > 0 and nl_line > 0:
+                    n_ctx = _build_word_ctx(
+                        line_wids, line_whash, nw_line,
+                        word_ngrams, bucket, ngram_base, ctx_buf)
+                    rng_state = (rng_state * np.int64(48271)) % \
+                        np.int64(2147483647)
+                    target_buf[0] = line_lids[np.int32(
+                        np.uint64(rng_state) % np.uint64(nl_line))]
+                    n_targets = np.int32(1)
+                    do_train = True
+
+            elif mode == 1:
+                if nw_line > 0 and nl_line >= 2:
+                    rng_state = (rng_state * np.int64(48271)) % \
+                        np.int64(2147483647)
+                    idx = np.int32(
+                        np.uint64(rng_state) % np.uint64(nl_line))
+                    n_ctx = _build_word_ctx(
+                        line_wids, line_whash, nw_line,
+                        word_ngrams, bucket, ngram_base, ctx_buf)
+                    for k in range(nl_line):
+                        if k != idx:
+                            ctx_buf[n_ctx] = line_lids[k]
+                            n_ctx += 1
+                    target_buf[0] = line_lids[idx]
+                    n_targets = np.int32(1)
+                    do_train = True
+
+            elif mode == 2:
+                if nw_line > 0 and nl_line >= 2:
+                    rng_state = (rng_state * np.int64(48271)) % \
+                        np.int64(2147483647)
+                    idx = np.int32(
+                        np.uint64(rng_state) % np.uint64(nl_line))
+                    n_ctx = _build_word_ctx(
+                        line_wids, line_whash, nw_line,
+                        word_ngrams, bucket, ngram_base, ctx_buf)
+                    ctx_buf[n_ctx] = line_lids[idx]
+                    n_ctx += 1
+                    nt = np.int32(0)
+                    for k in range(nl_line):
+                        if k != idx:
+                            target_buf[nt] = line_lids[k]
+                            nt += 1
+                    n_targets = nt
+                    do_train = True
+
+            elif mode == 3:
+                if nl_line >= 2:
+                    rng_state = (rng_state * np.int64(48271)) % \
+                        np.int64(2147483647)
+                    i1 = np.int32(
+                        np.uint64(rng_state) % np.uint64(nl_line))
+                    rng_state = (rng_state * np.int64(48271)) % \
+                        np.int64(2147483647)
+                    i2 = np.int32(
+                        np.uint64(rng_state) % np.uint64(nl_line))
+                    while i2 == i1:
+                        rng_state = (rng_state * np.int64(48271)) \
+                            % np.int64(2147483647)
+                        i2 = np.int32(
+                            np.uint64(rng_state) % np.uint64(
+                                nl_line))
+                    n_ctx = _build_word_ctx(
+                        line_wids, line_whash, nw_line,
+                        word_ngrams, bucket, ngram_base, ctx_buf)
+                    ctx_buf[n_ctx] = line_lids[i1]
+                    n_ctx += 1
+                    target_buf[0] = line_lids[i2]
+                    n_targets = np.int32(1)
+                    do_train = True
+
+            elif mode == 4:
+                if nl_line >= 2:
+                    n_ctx = _build_word_ctx(
+                        line_wids, line_whash, nw_line,
+                        word_ngrams, bucket, ngram_base, ctx_buf)
+                    ctx_buf[n_ctx] = line_lids[0]
+                    n_ctx += 1
+                    target_buf[0] = line_lids[1]
+                    n_targets = np.int32(1)
+                    do_train = True
+
+            if do_train:
+                tok_count += np.int64(nw_line)
+                progress = np.float64(tok_count) / np.float64(
+                    total_tokens)
+                cur_lr = np.float32(
+                    np.float64(base_lr) * (1.0 - progress))
+                if cur_lr <= np.float32(0.0):
+                    done = True
+                else:
+                    loss, rng_state = _train_step(
+                        emb, adagrad,
+                        ctx_buf, n_ctx, target_buf, n_targets,
+                        lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
+                        neg_ids, neg_flags,
+                        dim, nwords, nlabels, margin,
+                        neg_search_limit,
+                        cur_lr, rng_state, norm_limit, mode)
+                    loss_sum += loss
+                    n_steps += 1
 
     return loss_sum, n_steps, tok_count, rng_state
 
@@ -971,6 +1000,11 @@ class StarSpace:
         t0 = time.time()
         ep = 0
 
+        # pre-compute line offsets for per-epoch shuffling
+        line_offsets = _find_line_offsets(buf, buf_len)
+        n_lines = np.int64(len(line_offsets))
+        perm = np.arange(n_lines, dtype=np.int64)
+
         while tok_count < np.int64(total):
             loss, steps, tok_count, rng_state = _train_epoch(
                 self.emb, adagrad, buf, buf_len,
@@ -981,7 +1015,8 @@ class StarSpace:
                 np.float32(self.margin), np.int32(self.neg_search_limit),
                 np.float32(self.lr), np.int64(total),
                 rng_state, tok_count, np.float32(self.norm_limit),
-                np.int32(self.train_mode), np.int32(self.ws))
+                np.int32(self.train_mode), np.int32(self.ws),
+                line_offsets, n_lines, perm)
             loss_acc += float(loss)
             n_acc += int(steps)
             ep += 1

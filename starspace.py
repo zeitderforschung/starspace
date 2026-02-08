@@ -18,26 +18,22 @@ Training modes::
 
 ::
 
-    # From a file (convenience):
     model = StarSpace.train("train.txt", dim=100, epoch=5)
     model.test("test.txt")                     # → (N, P@1, R@1)
+    model.predict("the food was great")        # → [("__label__pos", 0.92)]
 
-    # From any iterable of token lists:
+    # From any iterable of token lists (spills to temp file):
     lines = [["__label__pos", "love", "this"], ["__label__neg", "awful"]]
     model = StarSpace.train(lines, dim=100, epoch=5)
-    model.test(iter_lines("test.txt"))
-
-    model.predict("the food was great")        # → [("__label__pos", 0.92)]
 
 Requires only **numpy** and **numba** (no C compiler, no scipy).
 """
 
 from __future__ import annotations
 
-import argparse, math, os, random as _random, sys, tempfile, time
-from collections import Counter
+import argparse, os, sys, tempfile, time
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator
+from typing import Iterator
 
 import numpy as np
 from numba import njit
@@ -45,13 +41,7 @@ from numba import njit
 # ── public helpers ────────────────────────────────────────────────────────────
 
 def iter_lines(path: str) -> Iterator[list[str]]:
-    """Yield tokenized lines from a text file.
-
-    Each yielded item is a list of tokens (words and/or ``__label__`` tags).
-    This is the bridge between file-based I/O and the iterator-based core API::
-
-        model = StarSpace.train(iter_lines("train.txt"))
-    """
+    """Yield tokenized lines from a text file."""
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             tokens = line.split()
@@ -70,14 +60,327 @@ def _fnv1a_bytes(data):
         h = (h ^ sb) * np.uint32(16777619)
     return np.int32(h)
 
-# ── monolithic epoch kernel (hinge loss, cosine similarity, AdaGrad) ─────────
+# ── mmap text pipeline ────────────────────────────────────────────────────────
 #
-# ALL training for one epoch in a single @njit call.
-# Supports extra LHS features (labels in LHS for modes 1-4) and
-# multi-label RHS (mode 2: sum all RHS labels).
-#
-# Hinge loss: max(0, margin - cos(lhs, rhs+) + cos(lhs, rhs-))
-# AdaGrad: per-row accumulated gradient for adaptive learning rates.
+# Operates directly on a memory-mapped text file (uint8 bytes), no temp files:
+#   Pass 1: _vocab_scan       — hash table + line offsets from raw bytes
+#   Pass 2: _extract_vocab    — filter, sort, assign final IDs → Vocab
+#   Pass 3: _build_training   — in-memory training arrays from raw bytes
+#   Train:  _train_epoch      — hinge loss + AdaGrad on the arrays
+
+@njit(cache=True)
+def _vocab_scan(buf, buf_len,
+                      ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                      ht_freq, ht_is_label,
+                      table_mask, line_starts, label_prefix):
+    """Pass 1: scan mmap bytes → hash table + line offsets.
+
+    Returns (n_unique, n_tokens, n_lines, status).
+    status: 0 = success, -1 = table overflow (caller should grow & retry).
+    """
+    n_unique = np.int64(0)
+    n_tokens = np.int64(0)
+    n_lines  = np.int64(0)
+    table_size = np.int64(table_mask + 1)
+    lp_len = len(label_prefix)
+
+    line_starts[0] = np.int64(0)
+
+    i = np.int64(0)
+    while i < buf_len:
+        b = buf[i]
+        if b == 32 or b == 9 or b == 13:
+            i += 1
+            continue
+        if b == 10:
+            n_lines += 1
+            line_starts[n_lines] = i + 1
+            i += 1
+            continue
+
+        # token start
+        tok_start = i
+        while i < buf_len:
+            b2 = buf[i]
+            if b2 == 32 or b2 == 9 or b2 == 10 or b2 == 13:
+                break
+            i += 1
+        tok_end = i
+        tok_len = np.int32(tok_end - tok_start)
+
+        # FNV-1a
+        h = np.uint32(2166136261)
+        for k in range(tok_start, tok_end):
+            b3 = buf[k]
+            sb = np.uint32(b3) if b3 < 128 else np.uint32(np.int32(np.int8(b3)))
+            h = (h ^ sb) * np.uint32(16777619)
+        fnv = np.int32(h)
+
+        # open-addressing lookup
+        slot = np.int64(np.uint32(h) & np.uint32(table_mask))
+        while ht_occ[slot] == np.int8(1):
+            if ht_fnv[slot] == fnv and ht_tok_len[slot] == tok_len:
+                match = True
+                ref = ht_tok_start[slot]
+                for k in range(tok_len):
+                    if buf[tok_start + k] != buf[ref + k]:
+                        match = False
+                        break
+                if match:
+                    ht_freq[slot] += np.int64(1)
+                    break
+            slot = (slot + 1) & table_mask
+
+        if ht_occ[slot] == np.int8(0):
+            if n_unique >= table_size * 7 // 10:
+                return n_unique, n_tokens, n_lines, np.int32(-1)
+            ht_occ[slot] = np.int8(1)
+            ht_fnv[slot] = fnv
+            ht_tok_start[slot] = tok_start
+            ht_tok_len[slot] = tok_len
+            ht_freq[slot] = np.int64(1)
+            is_label = np.int8(0)
+            if tok_len >= lp_len:
+                is_label = np.int8(1)
+                for k in range(lp_len):
+                    if buf[tok_start + k] != label_prefix[k]:
+                        is_label = np.int8(0)
+                        break
+            ht_is_label[slot] = is_label
+            n_unique += 1
+
+        n_tokens += 1
+
+    # sentinel for last line (file may not end with \n)
+    if buf_len > 0 and buf[buf_len - 1] != 10:
+        n_lines += 1
+    line_starts[n_lines] = buf_len
+
+    return n_unique, n_tokens, n_lines, np.int32(0)
+
+
+@njit(cache=True)
+def _build_training(buf, buf_len, line_starts, n_lines,
+                          ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                          ht_is_label, table_mask, remap,
+                          nwords, mode, ws, rng_state,
+                          out_ids, out_hash, out_lbl, out_extra,
+                          out_ioff, out_loff, out_eoff, out_neg):
+    """Pass 3: re-scan mmap text → fill in-memory training arrays.
+
+    Returns (n_examples, ids_cur, lbl_cur, extra_cur, neg_cur, rng_state).
+    """
+    MAX_TOK = np.int32(100000)
+    line_wids  = np.empty(MAX_TOK, np.int32)
+    line_whash = np.empty(MAX_TOK, np.int32)
+    line_lids  = np.empty(MAX_TOK, np.int32)
+
+    ids_cur   = np.int64(0)
+    lbl_cur   = np.int64(0)
+    extra_cur = np.int64(0)
+    neg_cur   = np.int64(0)
+    n_ex      = np.int64(0)
+
+    out_ioff[0] = np.int64(0)
+    out_loff[0] = np.int64(0)
+    out_eoff[0] = np.int64(0)
+
+    for li in range(n_lines):
+        ls = line_starts[li]
+        le = line_starts[li + 1]
+
+        # tokenize line
+        nw_line = np.int32(0)
+        nl_line = np.int32(0)
+        i = ls
+        while i < le:
+            b = buf[i]
+            if b == 32 or b == 9 or b == 10 or b == 13:
+                i += 1
+                continue
+            tok_start = i
+            while i < le:
+                b2 = buf[i]
+                if b2 == 32 or b2 == 9 or b2 == 10 or b2 == 13:
+                    break
+                i += 1
+            tok_end = i
+            tok_len = np.int32(tok_end - tok_start)
+
+            # FNV-1a
+            h = np.uint32(2166136261)
+            for k in range(tok_start, tok_end):
+                b3 = buf[k]
+                sb = np.uint32(b3) if b3 < 128 else np.uint32(np.int32(np.int8(b3)))
+                h = (h ^ sb) * np.uint32(16777619)
+            fnv = np.int32(h)
+
+            # hash table lookup
+            slot = np.int64(np.uint32(h) & np.uint32(table_mask))
+            fid = np.int32(-1)
+            while ht_occ[slot] == np.int8(1):
+                if ht_fnv[slot] == fnv and ht_tok_len[slot] == tok_len:
+                    match = True
+                    ref = ht_tok_start[slot]
+                    for k in range(tok_len):
+                        if buf[tok_start + k] != buf[ref + k]:
+                            match = False
+                            break
+                    if match:
+                        fid = remap[slot]
+                        break
+                slot = (slot + 1) & table_mask
+
+            if fid < 0:
+                continue
+            if fid < nwords:
+                if nw_line < MAX_TOK:
+                    line_wids[nw_line] = fid
+                    line_whash[nw_line] = fnv
+                    nw_line += 1
+            else:
+                if nl_line < MAX_TOK:
+                    line_lids[nl_line] = fid
+                    nl_line += 1
+
+        # ── mode logic ──
+        if mode == 5:
+            for wi in range(nw_line):
+                ctx_start = max(np.int32(0), wi - np.int32(ws))
+                ctx_end = min(nw_line, wi + np.int32(ws) + np.int32(1))
+                n_ctx = np.int32(0)
+                for ci in range(ctx_start, ctx_end):
+                    if ci != wi:
+                        out_ids[ids_cur + n_ctx] = line_wids[ci]
+                        out_hash[ids_cur + n_ctx] = line_whash[ci]
+                        n_ctx += 1
+                if n_ctx == 0:
+                    continue
+                ids_cur += n_ctx
+                out_lbl[lbl_cur] = line_wids[wi]
+                lbl_cur += 1
+                out_neg[neg_cur] = line_wids[wi]
+                neg_cur += 1
+                n_ex += 1
+                out_ioff[n_ex] = ids_cur
+                out_loff[n_ex] = lbl_cur
+                out_eoff[n_ex] = extra_cur
+            continue
+
+        if mode == 0:
+            if nw_line == 0 or nl_line == 0:
+                continue
+            for k in range(nw_line):
+                out_ids[ids_cur + k] = line_wids[k]
+                out_hash[ids_cur + k] = line_whash[k]
+            ids_cur += nw_line
+            for k in range(nl_line):
+                out_lbl[lbl_cur + k] = line_lids[k]
+            lbl_cur += nl_line
+            for k in range(nl_line):
+                out_neg[neg_cur + k] = line_lids[k]
+            neg_cur += nl_line
+            n_ex += 1
+            out_ioff[n_ex] = ids_cur
+            out_loff[n_ex] = lbl_cur
+            out_eoff[n_ex] = extra_cur
+
+        elif mode == 1:
+            if nw_line == 0 or nl_line < 2:
+                continue
+            rng_state = np.int64(
+                (rng_state * np.int64(48271)) % np.int64(2147483647))
+            idx = np.int32(np.uint64(rng_state) % np.uint64(nl_line))
+            for k in range(nw_line):
+                out_ids[ids_cur + k] = line_wids[k]
+                out_hash[ids_cur + k] = line_whash[k]
+            ids_cur += nw_line
+            for k in range(nl_line):
+                if k != idx:
+                    out_extra[extra_cur] = line_lids[k]
+                    extra_cur += 1
+            out_lbl[lbl_cur] = line_lids[idx]
+            lbl_cur += 1
+            out_neg[neg_cur] = line_lids[idx]
+            neg_cur += 1
+            n_ex += 1
+            out_ioff[n_ex] = ids_cur
+            out_loff[n_ex] = lbl_cur
+            out_eoff[n_ex] = extra_cur
+
+        elif mode == 2:
+            if nw_line == 0 or nl_line < 2:
+                continue
+            rng_state = np.int64(
+                (rng_state * np.int64(48271)) % np.int64(2147483647))
+            idx = np.int32(np.uint64(rng_state) % np.uint64(nl_line))
+            for k in range(nw_line):
+                out_ids[ids_cur + k] = line_wids[k]
+                out_hash[ids_cur + k] = line_whash[k]
+            ids_cur += nw_line
+            out_extra[extra_cur] = line_lids[idx]
+            extra_cur += 1
+            for k in range(nl_line):
+                if k != idx:
+                    out_lbl[lbl_cur] = line_lids[k]
+                    lbl_cur += 1
+                    out_neg[neg_cur] = line_lids[k]
+                    neg_cur += 1
+            n_ex += 1
+            out_ioff[n_ex] = ids_cur
+            out_loff[n_ex] = lbl_cur
+            out_eoff[n_ex] = extra_cur
+
+        elif mode == 3:
+            if nl_line < 2:
+                continue
+            rng_state = np.int64(
+                (rng_state * np.int64(48271)) % np.int64(2147483647))
+            idx1 = np.int32(np.uint64(rng_state) % np.uint64(nl_line))
+            rng_state = np.int64(
+                (rng_state * np.int64(48271)) % np.int64(2147483647))
+            idx2 = np.int32(np.uint64(rng_state) % np.uint64(nl_line))
+            while idx2 == idx1:
+                rng_state = np.int64(
+                    (rng_state * np.int64(48271)) % np.int64(2147483647))
+                idx2 = np.int32(np.uint64(rng_state) % np.uint64(nl_line))
+            for k in range(nw_line):
+                out_ids[ids_cur + k] = line_wids[k]
+                out_hash[ids_cur + k] = line_whash[k]
+            ids_cur += nw_line
+            out_extra[extra_cur] = line_lids[idx1]
+            extra_cur += 1
+            out_lbl[lbl_cur] = line_lids[idx2]
+            lbl_cur += 1
+            out_neg[neg_cur] = line_lids[idx2]
+            neg_cur += 1
+            n_ex += 1
+            out_ioff[n_ex] = ids_cur
+            out_loff[n_ex] = lbl_cur
+            out_eoff[n_ex] = extra_cur
+
+        elif mode == 4:
+            if nl_line < 2:
+                continue
+            for k in range(nw_line):
+                out_ids[ids_cur + k] = line_wids[k]
+                out_hash[ids_cur + k] = line_whash[k]
+            ids_cur += nw_line
+            out_extra[extra_cur] = line_lids[0]
+            extra_cur += 1
+            out_lbl[lbl_cur] = line_lids[1]
+            lbl_cur += 1
+            out_neg[neg_cur] = line_lids[1]
+            neg_cur += 1
+            n_ex += 1
+            out_ioff[n_ex] = ids_cur
+            out_loff[n_ex] = lbl_cur
+            out_eoff[n_ex] = extra_cur
+
+    return n_ex, ids_cur, lbl_cur, extra_cur, neg_cur, rng_state
+
+
+# ── epoch training kernel (hinge loss, cosine similarity, AdaGrad) ───────────
 
 @njit(fastmath=True, cache=True)
 def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
@@ -223,7 +526,6 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
                 np.uint64(rng_state) % np.uint64(neg_pool_size))]
             neg_ids[ni] = neg_label
 
-            # Skip if negative is any of the positive targets
             is_pos = False
             for t in range(n_targets):
                 if neg_label == target_buf[t]:
@@ -233,7 +535,6 @@ def _train_epoch(emb, adagrad, flat_lhs, flat_hashes, flat_labels,
                 neg_flags[ni] = np.int32(0)
                 continue
 
-            # Negative embedding: L2 normalise
             norm_sq = np.float32(0.0)
             for d in range(dim):
                 rhs_neg[d] = emb[neg_label, d]
@@ -339,44 +640,6 @@ class Vocab:
     word_ngrams: int            = 1
     label_prefix: str           = "__label__"
 
-    @classmethod
-    def build(cls, data: Iterable[list[str]], *, min_count=1,
-              bucket=2_000_000, word_ngrams=1, label_prefix="__label__",
-              verbose=2) -> Vocab:
-        word_freq: Counter[str] = Counter()
-        label_freq: Counter[str] = Counter()
-        ntokens = 0
-        for tokens in data:
-            for tok in tokens:
-                ntokens += 1
-                if tok.startswith(label_prefix):
-                    label_freq[tok] += 1
-                else:
-                    word_freq[tok] += 1
-                if verbose > 1 and ntokens % 1_000_000 == 0:
-                    print(f"\rRead {ntokens // 1_000_000}M words",
-                          end="", file=sys.stderr)
-
-        real_words = [w for w, c in word_freq.most_common() if c >= min_count]
-        labels = [l for l, _ in label_freq.most_common()]
-
-        w2i = {w: i for i, w in enumerate(real_words)}
-        l2i = {l: i for i, l in enumerate(labels)}
-        whash = {w: int(_fnv1a_bytes(
-            np.frombuffer(w.encode("utf-8"), dtype=np.uint8)))
-            for w in real_words}
-
-        bkt = bucket if word_ngrams > 1 else 0
-
-        if verbose > 0:
-            print(f"\rRead {ntokens // 1_000_000}M words — "
-                  f"vocab {len(real_words)} words, {len(labels)} labels "
-                  f"(min_count={min_count})", file=sys.stderr)
-
-        return cls(words=real_words, labels=labels, w2i=w2i, l2i=l2i,
-                   whash=whash, ntokens=ntokens, bucket=bkt,
-                   word_ngrams=word_ngrams, label_prefix=label_prefix)
-
     @property
     def nwords(self) -> int:
         return len(self.words)
@@ -387,11 +650,7 @@ class Vocab:
 
     def tokenise_line(self, tokens: list[str]
                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Parse tokens → (word_ids, word_hashes, label_emb_ids).
-
-        word_ids are [0, nwords).
-        label_emb_ids are global embedding indices [nwords, nwords+nlabels).
-        """
+        """Parse tokens → (word_ids, word_hashes, label_emb_ids)."""
         w2i, whash, l2i = self.w2i, self.whash, self.l2i
         prefix = self.label_prefix
         nw = self.nwords
@@ -401,7 +660,7 @@ class Vocab:
             if tok.startswith(prefix):
                 lid = l2i.get(tok)
                 if lid is not None:
-                    label_ids.append(nw + lid)  # global embedding index
+                    label_ids.append(nw + lid)
             else:
                 wid = w2i.get(tok, -1)
                 if wid >= 0:
@@ -411,6 +670,74 @@ class Vocab:
         return (np.array(word_ids, dtype=np.int32),
                 np.array(word_hashes, dtype=np.int32),
                 np.array(label_ids, dtype=np.int32))
+
+# ── hash table helpers (Pass 2) ──────────────────────────────────────────────
+
+def _alloc_hash_table(estimated_unique):
+    """Allocate struct-of-arrays hash table (power-of-2 size)."""
+    table_size = 1
+    while table_size < max(estimated_unique * 4, 1 << 16):
+        table_size <<= 1
+    mask = np.int64(table_size - 1)
+    return (np.zeros(table_size, np.int32),   # ht_fnv
+            np.zeros(table_size, np.int8),     # ht_occ
+            np.zeros(table_size, np.int64),    # ht_tok_start
+            np.zeros(table_size, np.int32),    # ht_tok_len
+            np.zeros(table_size, np.int64),    # ht_freq
+            np.zeros(table_size, np.int8),     # ht_is_label
+            mask, table_size)
+
+def _extract_vocab(buf, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                   ht_freq, ht_is_label, n_tokens, *,
+                   min_count, bucket, word_ngrams, label_prefix,
+                   verbose):
+    """Pass 2: extract Vocab + remap from hash table."""
+    table_size = len(ht_occ)
+    occupied = np.where(ht_occ == 1)[0]
+
+    word_slots = occupied[ht_is_label[occupied] == 0]
+    label_slots = occupied[ht_is_label[occupied] == 1]
+
+    word_slots = word_slots[ht_freq[word_slots] >= min_count]
+
+    word_slots = word_slots[np.argsort(-ht_freq[word_slots])]
+    label_slots = label_slots[np.argsort(-ht_freq[label_slots])]
+
+    nwords = len(word_slots)
+    nlabels = len(label_slots)
+
+    remap = np.full(table_size, -1, dtype=np.int32)
+    for i, slot in enumerate(word_slots):
+        remap[slot] = i
+    for i, slot in enumerate(label_slots):
+        remap[slot] = nwords + i
+
+    words, whash = [], {}
+    for i, slot in enumerate(word_slots):
+        s = int(ht_tok_start[slot])
+        e = s + int(ht_tok_len[slot])
+        w = bytes(buf[s:e]).decode("utf-8", errors="replace")
+        words.append(w)
+        whash[w] = int(ht_fnv[slot])
+    labels = []
+    for slot in label_slots:
+        s = int(ht_tok_start[slot])
+        e = s + int(ht_tok_len[slot])
+        labels.append(bytes(buf[s:e]).decode("utf-8", errors="replace"))
+
+    w2i = {w: i for i, w in enumerate(words)}
+    l2i = {l: i for i, l in enumerate(labels)}
+    bkt = bucket if word_ngrams > 1 else 0
+
+    if verbose > 0:
+        print(f"\rRead {int(n_tokens) // 1_000_000}M words — "
+              f"vocab {nwords} words, {nlabels} labels "
+              f"(min_count={min_count})", file=sys.stderr)
+
+    vocab = Vocab(words=words, labels=labels, w2i=w2i, l2i=l2i,
+                  whash=whash, ntokens=int(n_tokens), bucket=bkt,
+                  word_ngrams=word_ngrams, label_prefix=label_prefix)
+    return vocab, remap
 
 # ── model ────────────────────────────────────────────────────────────────────
 
@@ -454,7 +781,6 @@ class StarSpace:
         if len(word_ids) == 0:
             return []
 
-        # Build input features: words + n-gram buckets
         input_ids = list(word_ids)
         if v.word_ngrams > 1 and v.bucket > 0:
             _M = np.uint64(0xFFFFFFFFFFFFFFFF)
@@ -467,7 +793,6 @@ class StarSpace:
                           (np.uint64(np.int64(word_hashes[j])) & _M)) & _M
                     input_ids.append(ngram_base + int(hv % np.uint64(v.bucket)))
 
-        # LHS embedding: sum + L2 normalise
         lhs = np.zeros(self.dim, np.float32)
         for idx in input_ids:
             lhs += self.emb[idx]
@@ -475,7 +800,6 @@ class StarSpace:
         if n > 0:
             lhs /= n
 
-        # Cosine similarity with all label embeddings
         nw = v.nwords
         label_embs = self.emb[nw:nw + v.nlabels]
         norms = np.linalg.norm(label_embs, axis=1, keepdims=True)
@@ -486,11 +810,7 @@ class StarSpace:
         return [(v.labels[i], float(sims[i])) for i in top_k]
 
     def test(self, data, k: int = 1) -> tuple[int, float, float]:
-        """Evaluate on labeled data. Returns (N, precision@k, recall@k).
-
-        *data* is a file path (str) or an iterable of token lists.
-        Not available for trainMode 5 (word embedding).
-        """
+        """Evaluate on labeled data. Returns (N, precision@k, recall@k)."""
         if self.train_mode == 5:
             raise ValueError("test() is not defined for trainMode 5")
         if isinstance(data, str):
@@ -573,102 +893,7 @@ class StarSpace:
             train_mode=train_mode, ws=ws,
         )
 
-    # ── training ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _build_vocab_and_cache(data, cache_dir, *, min_count=1,
-                               bucket=2_000_000, word_ngrams=1,
-                               label_prefix="__label__", verbose=2):
-        """Single pass over *data*: count frequencies + write provisional ID cache.
-
-        Writes ``prov.bin`` (int32 per token) and ``off.bin`` (int64 per line)
-        to *cache_dir*.
-
-        Returns ``(vocab, remap, final_hash)`` where *remap[prov_id]* gives
-        the final embedding index (or -1 if filtered by min_count) and
-        *final_hash[final_word_id]* gives the FNV-1a hash.
-        """
-        tok2prov: dict[str, int] = {}
-        prov_is_label: list[bool] = []
-        prov_hash: list[int] = []
-        prov_freq: list[int] = []
-
-        prov_path = os.path.join(cache_dir, "prov.bin")
-        off_path = os.path.join(cache_dir, "off.bin")
-        f_prov = open(prov_path, "wb")
-        f_off = open(off_path, "wb")
-        f_off.write(np.int64(0).tobytes())
-
-        ntokens = 0
-        for tokens in data:
-            for tok in tokens:
-                ntokens += 1
-                pid = tok2prov.get(tok)
-                if pid is None:
-                    pid = len(tok2prov)
-                    tok2prov[tok] = pid
-                    is_lbl = tok.startswith(label_prefix)
-                    prov_is_label.append(is_lbl)
-                    prov_hash.append(
-                        0 if is_lbl else int(_fnv1a_bytes(
-                            np.frombuffer(tok.encode("utf-8"),
-                                          dtype=np.uint8))))
-                    prov_freq.append(0)
-                prov_freq[pid] += 1
-                f_prov.write(np.int32(pid).tobytes())
-            f_off.write(np.int64(f_prov.tell() // 4).tobytes())
-            if verbose > 1 and ntokens % 1_000_000 == 0:
-                print(f"\rRead {ntokens // 1_000_000}M words",
-                      end="", file=sys.stderr)
-
-        f_prov.close()
-        f_off.close()
-
-        # Separate surviving words and labels, sorted by frequency desc
-        prov2str = {v: k for k, v in tok2prov.items()}
-
-        word_items: list[tuple[int, str, int]] = []
-        label_items: list[tuple[int, str, int]] = []
-        for pid in range(len(prov_freq)):
-            s = prov2str[pid]
-            if prov_is_label[pid]:
-                label_items.append((pid, s, prov_freq[pid]))
-            elif prov_freq[pid] >= min_count:
-                word_items.append((pid, s, prov_freq[pid]))
-
-        word_items.sort(key=lambda x: -x[2])
-        label_items.sort(key=lambda x: -x[2])
-
-        words = [s for _, s, _ in word_items]
-        labels = [s for _, s, _ in label_items]
-        nwords = len(words)
-
-        # Remap: prov_id → final embedding index, -1 for filtered
-        remap = np.full(len(tok2prov), -1, dtype=np.int32)
-        for final_wid, (pid, _, _) in enumerate(word_items):
-            remap[pid] = final_wid
-        for final_lid, (pid, _, _) in enumerate(label_items):
-            remap[pid] = nwords + final_lid
-
-        # Hash table: final_word_id → fnv1a
-        final_hash = np.array([prov_hash[pid] for pid, _, _ in word_items],
-                              dtype=np.int32)
-
-        w2i = {w: i for i, w in enumerate(words)}
-        l2i = {l: i for i, l in enumerate(labels)}
-        whash = {words[i]: int(final_hash[i]) for i in range(nwords)}
-        bkt = bucket if word_ngrams > 1 else 0
-
-        if verbose > 0:
-            print(f"\rRead {ntokens // 1_000_000}M words — "
-                  f"vocab {nwords} words, {len(labels)} labels "
-                  f"(min_count={min_count})", file=sys.stderr)
-
-        vocab = Vocab(words=words, labels=labels, w2i=w2i, l2i=l2i,
-                      whash=whash, ntokens=ntokens, bucket=bkt,
-                      word_ngrams=word_ngrams, label_prefix=label_prefix)
-
-        return vocab, remap, final_hash
+    # ── training (mmap pipeline, no temp files) ──────────────────────────
 
     @classmethod
     def train(cls, data, *, dim=100, epoch=5, lr=0.01,
@@ -678,209 +903,147 @@ class StarSpace:
               train_mode=0, ws=5) -> StarSpace:
         """Train a StarSpace model.
 
-        *data* is a file path (str) or an iterable of token lists, where each
-        token list mixes ``__label__*`` tags with ordinary words::
-
-            model = StarSpace.train("train.txt")
-            model = StarSpace.train([["__label__pos", "great", "movie"]])
-
-        *train_mode* selects the LHS/RHS construction (0-5).
-        *ws* is the context window size for trainMode 5.
+        *data* is a file path (str) or an iterable of token lists.
+        File paths use the Numba mmap pipeline (no temp files).
+        Iterables are spilled to a temp file first.
         """
-        if isinstance(data, str):
-            data = iter_lines(data)
-
-        cache_dir = tempfile.mkdtemp(prefix="ss_")
-        try:
-            vocab, remap, final_hash = cls._build_vocab_and_cache(
-                data, cache_dir, min_count=min_count, bucket=bucket,
-                word_ngrams=word_ngrams, verbose=verbose)
-
-            n_emb = vocab.nwords + vocab.nlabels + vocab.bucket
-            rng = np.random.RandomState(seed)
-            emb = (rng.normal(0, init_rand_sd, (n_emb, dim))).astype(
-                np.float32)
-
-            model = cls(vocab=vocab, emb=emb, dim=dim,
-                        word_ngrams=word_ngrams, margin=margin,
-                        neg_search_limit=neg_search_limit,
-                        lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
-                        verbose=verbose, train_mode=train_mode, ws=ws)
-            model._fit(cache_dir, remap, final_hash)
-        finally:
-            for fn in os.listdir(cache_dir):
+        if not isinstance(data, str):
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8")
+            try:
+                for tokens in data:
+                    tmp.write(" ".join(tokens) + "\n")
+                tmp.close()
+                return cls.train(
+                    tmp.name, dim=dim, epoch=epoch, lr=lr, margin=margin,
+                    neg_search_limit=neg_search_limit, min_count=min_count,
+                    word_ngrams=word_ngrams, bucket=bucket,
+                    norm_limit=norm_limit, init_rand_sd=init_rand_sd,
+                    seed=seed, verbose=verbose, train_mode=train_mode, ws=ws)
+            finally:
                 try:
-                    os.unlink(os.path.join(cache_dir, fn))
+                    os.unlink(tmp.name)
                 except OSError:
                     pass
-            try:
-                os.rmdir(cache_dir)
-            except OSError:
-                pass
 
+        path = data
+        label_prefix_str = "__label__"
+
+        # ── mmap the text file ──
+        buf = np.memmap(path, dtype=np.uint8, mode="r")
+        buf_len = np.int64(len(buf))
+
+        # ── Pass 1: vocab scan (Numba) ──
+        n_newlines = int(np.sum(buf == 10))
+        line_starts = np.empty(n_newlines + 2, dtype=np.int64)
+        label_prefix_bytes = np.frombuffer(
+            label_prefix_str.encode("utf-8"), dtype=np.uint8)
+
+        estimated = min(int(buf_len) // 4, 4_000_000)
+        (ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+         ht_freq, ht_is_label, mask, table_size) = _alloc_hash_table(
+             estimated)
+
+        n_unique, n_tokens, n_lines, status = _vocab_scan(
+            buf, buf_len, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+            ht_freq, ht_is_label, mask, line_starts, label_prefix_bytes)
+
+        while status == -1:
+            estimated = int(n_unique) * 4
+            (ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+             ht_freq, ht_is_label, mask, table_size) = _alloc_hash_table(
+                 estimated)
+            line_starts = np.empty(n_newlines + 2, dtype=np.int64)
+            n_unique, n_tokens, n_lines, status = _vocab_scan(
+                buf, buf_len, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                ht_freq, ht_is_label, mask, line_starts, label_prefix_bytes)
+
+        line_starts = line_starts[:n_lines + 1]
+
+        # ── Pass 2: extract vocab (Python) ──
+        vocab, remap = _extract_vocab(
+            buf, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+            ht_freq, ht_is_label, n_tokens,
+            min_count=min_count, bucket=bucket, word_ngrams=word_ngrams,
+            label_prefix=label_prefix_str, verbose=verbose)
+
+        # ── Init model ──
+        n_emb = vocab.nwords + vocab.nlabels + vocab.bucket
+        rng = np.random.RandomState(seed)
+        emb = rng.normal(0, init_rand_sd, (n_emb, dim)).astype(np.float32)
+
+        model = cls(vocab=vocab, emb=emb, dim=dim,
+                    word_ngrams=word_ngrams, margin=margin,
+                    neg_search_limit=neg_search_limit,
+                    lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
+                    verbose=verbose, train_mode=train_mode, ws=ws)
+
+        # ── Pass 3 + training ──
+        model._fit(buf, buf_len, line_starts, n_lines,
+                   ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                   ht_is_label, mask, remap)
         return model
 
-    def _fit(self, cache_dir, remap, final_hash):
+    def _fit(self, buf, buf_len, line_starts, n_lines,
+             ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+             ht_is_label, mask, remap):
+        """Build in-memory training arrays from mmap text, then train."""
         v = self.vocab
-        total = self.epoch * v.ntokens
-        rng_state = np.int64(self.seed + 1)
         mode = self.train_mode
-        nw = v.nwords
+        rng_state_build = np.int64(self.seed + 1)
 
-        adagrad = np.zeros(self.emb.shape[0], np.float32)
+        # upper bound allocation
+        ntok = int(v.ntokens)
+        if mode == 5:
+            max_ids = ntok * 2 * self.ws
+            max_lbl = ntok
+            max_extra = 1
+            max_ex = ntok
+        else:
+            max_ids = ntok
+            max_lbl = ntok
+            max_extra = ntok
+            max_ex = int(n_lines)
 
-        def _mmap_or_empty(p, dt):
-            if os.path.getsize(p) == 0:
-                return np.empty(0, dtype=dt)
-            return np.memmap(p, dtype=dt, mode="r")
+        out_ids   = np.empty(max(max_ids, 1),  np.int32)
+        out_hash  = np.empty(max(max_ids, 1),  np.int32)
+        out_lbl   = np.empty(max(max_lbl, 1),  np.int32)
+        out_extra = np.empty(max(max_extra, 1), np.int32)
+        out_ioff  = np.empty(max_ex + 1,        np.int64)
+        out_loff  = np.empty(max_ex + 1,        np.int64)
+        out_eoff  = np.empty(max_ex + 1,        np.int64)
+        out_neg   = np.empty(max(max_lbl, 1),  np.int32)
 
-        # ── Read provisional cache ──
-        prov_ids = _mmap_or_empty(
-            os.path.join(cache_dir, "prov.bin"), np.int32)
-        line_offsets = _mmap_or_empty(
-            os.path.join(cache_dir, "off.bin"), np.int64)
-        n_lines = len(line_offsets) - 1
+        n_ex, ids_cur, lbl_cur, extra_cur, neg_cur, _ = \
+            _build_training(
+                buf, buf_len, line_starts, np.int64(n_lines),
+                ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
+                ht_is_label, mask, remap,
+                np.int32(v.nwords), np.int32(mode), np.int32(self.ws),
+                rng_state_build,
+                out_ids, out_hash, out_lbl, out_extra,
+                out_ioff, out_loff, out_eoff, out_neg)
 
-        # ── Build training mmaps from cache + remap ──
-        tmp_dir = tempfile.mkdtemp(prefix="ss_tr_")
-        names = ("ids", "hash", "lbl", "extra", "ioff", "loff", "eoff", "neg")
-        paths = {n: os.path.join(tmp_dir, f"{n}.bin") for n in names}
-
-        f = {n: open(p, "wb") for n, p in paths.items()}
-        f["ioff"].write(np.int64(0).tobytes())
-        f["loff"].write(np.int64(0).tobytes())
-        f["eoff"].write(np.int64(0).tobytes())
-
-        rng_py = _random.Random(self.seed)
-
-        for li in range(n_lines):
-            start = int(line_offsets[li])
-            end = int(line_offsets[li + 1])
-
-            # Remap provisional IDs → (word_ids, word_hashes, label_ids)
-            word_ids_l: list[int] = []
-            word_hashes_l: list[int] = []
-            label_ids_l: list[int] = []
-            for j in range(start, end):
-                fid = int(remap[prov_ids[j]])
-                if fid < 0:
-                    continue
-                if fid < nw:
-                    word_ids_l.append(fid)
-                    word_hashes_l.append(int(final_hash[fid]))
-                else:
-                    label_ids_l.append(fid)
-
-            word_ids = np.array(word_ids_l, dtype=np.int32)
-            word_hashes = np.array(word_hashes_l, dtype=np.int32)
-            label_ids = np.array(label_ids_l, dtype=np.int32)
-            nw_line = len(word_ids)
-            nl = len(label_ids)
-
-            if mode == 5:
-                for wi in range(nw_line):
-                    ctx_start = max(0, wi - self.ws)
-                    ctx_end = min(nw_line, wi + self.ws + 1)
-                    ctx_w = []
-                    ctx_h = []
-                    for ci in range(ctx_start, ctx_end):
-                        if ci != wi:
-                            ctx_w.append(word_ids[ci])
-                            ctx_h.append(word_hashes[ci])
-                    if not ctx_w:
-                        continue
-                    cw = np.array(ctx_w, dtype=np.int32)
-                    ch = np.array(ctx_h, dtype=np.int32)
-                    tw = np.array([word_ids[wi]], dtype=np.int32)
-                    f["ids"].write(cw.tobytes())
-                    f["hash"].write(ch.tobytes())
-                    f["lbl"].write(tw.tobytes())
-                    f["extra"].write(b"")
-                    f["ioff"].write(np.int64(
-                        f["ids"].tell() // 4).tobytes())
-                    f["loff"].write(np.int64(
-                        f["lbl"].tell() // 4).tobytes())
-                    f["eoff"].write(np.int64(
-                        f["extra"].tell() // 4).tobytes())
-                    f["neg"].write(tw.tobytes())
-                continue
-
-            if mode == 0:
-                if nw_line == 0 or nl == 0:
-                    continue
-                lhs_w, lhs_h = word_ids, word_hashes
-                lhs_extra = np.empty(0, np.int32)
-                rhs = label_ids
-            elif mode == 1:
-                if nw_line == 0 or nl < 2:
-                    continue
-                idx = rng_py.randrange(nl)
-                lhs_w, lhs_h = word_ids, word_hashes
-                lhs_extra = np.array(
-                    [label_ids[i] for i in range(nl) if i != idx],
-                    dtype=np.int32)
-                rhs = np.array([label_ids[idx]], dtype=np.int32)
-            elif mode == 2:
-                if nw_line == 0 or nl < 2:
-                    continue
-                idx = rng_py.randrange(nl)
-                lhs_w, lhs_h = word_ids, word_hashes
-                lhs_extra = np.array([label_ids[idx]], dtype=np.int32)
-                rhs = np.array(
-                    [label_ids[i] for i in range(nl) if i != idx],
-                    dtype=np.int32)
-            elif mode == 3:
-                if nl < 2:
-                    continue
-                idx1 = rng_py.randrange(nl)
-                idx2 = idx1
-                while idx2 == idx1:
-                    idx2 = rng_py.randrange(nl)
-                lhs_w, lhs_h = word_ids, word_hashes
-                lhs_extra = np.array([label_ids[idx1]], dtype=np.int32)
-                rhs = np.array([label_ids[idx2]], dtype=np.int32)
-            elif mode == 4:
-                if nl < 2:
-                    continue
-                lhs_w, lhs_h = word_ids, word_hashes
-                lhs_extra = np.array([label_ids[0]], dtype=np.int32)
-                rhs = np.array([label_ids[1]], dtype=np.int32)
-            else:
-                raise ValueError(f"Unknown train_mode {mode}")
-
-            f["ids"].write(lhs_w.tobytes())
-            f["hash"].write(lhs_h.tobytes())
-            f["lbl"].write(rhs.tobytes())
-            f["extra"].write(lhs_extra.tobytes())
-            f["ioff"].write(np.int64(f["ids"].tell() // 4).tobytes())
-            f["loff"].write(np.int64(f["lbl"].tell() // 4).tobytes())
-            f["eoff"].write(np.int64(f["extra"].tell() // 4).tobytes())
-            f["neg"].write(rhs.tobytes())
-
-        del prov_ids, line_offsets
-
-        for fh in f.values():
-            fh.close()
-
-        flat_ids = _mmap_or_empty(paths["ids"], np.int32)
-        flat_hashes = _mmap_or_empty(paths["hash"], np.int32)
-        flat_labels = _mmap_or_empty(paths["lbl"], np.int32)
-        flat_extra = _mmap_or_empty(paths["extra"], np.int32)
-        input_offsets = _mmap_or_empty(paths["ioff"], np.int64)
-        label_offsets = _mmap_or_empty(paths["loff"], np.int64)
-        extra_offsets = _mmap_or_empty(paths["eoff"], np.int64)
-        neg_pool = _mmap_or_empty(paths["neg"], np.int32)
-        n_examples = len(input_offsets) - 1
-        neg_pool_size = len(neg_pool)
+        flat_ids      = out_ids[:ids_cur]
+        flat_hashes   = out_hash[:ids_cur]
+        flat_labels   = out_lbl[:lbl_cur]
+        flat_extra    = out_extra[:extra_cur]
+        input_offsets = out_ioff[:n_ex + 1]
+        label_offsets = out_loff[:n_ex + 1]
+        extra_offsets = out_eoff[:n_ex + 1]
+        neg_pool      = out_neg[:neg_cur]
+        n_examples = int(n_ex)
+        neg_pool_size = int(neg_cur)
 
         if n_examples == 0 or neg_pool_size == 0:
             if self.verbose > 0:
                 print("No training examples.", file=sys.stderr)
-            self._cleanup_dir(tmp_dir)
             return
 
         multi_rhs = np.int32(1) if mode == 2 else np.int32(0)
-
+        total = self.epoch * v.ntokens
+        rng_state = np.int64(self.seed + 1)
+        adagrad = np.zeros(self.emb.shape[0], np.float32)
         tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0
         t0 = time.time()
@@ -915,22 +1078,6 @@ class StarSpace:
             avg = loss_acc / max(n_acc, 1) / self.neg_search_limit
             print(f"\rDone — avg loss {avg:.4f}"
                   f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
-
-        del flat_ids, flat_hashes, flat_labels, flat_extra
-        del input_offsets, label_offsets, extra_offsets, neg_pool
-        self._cleanup_dir(tmp_dir)
-
-    @staticmethod
-    def _cleanup_dir(tmp_dir):
-        for fn in os.listdir(tmp_dir):
-            try:
-                os.unlink(os.path.join(tmp_dir, fn))
-            except OSError:
-                pass
-        try:
-            os.rmdir(tmp_dir)
-        except OSError:
-            pass
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -967,7 +1114,7 @@ def _cli():
     args = p.parse_args()
     if args.cmd == "train":
         m = StarSpace.train(
-            iter_lines(args.corpus),
+            args.corpus,
             dim=args.dim, epoch=args.epoch, lr=args.lr,
             margin=args.margin, neg_search_limit=args.neg_search_limit,
             min_count=args.min_count, word_ngrams=args.word_ngrams,
@@ -977,7 +1124,7 @@ def _cli():
         m.save(args.output)
     elif args.cmd == "test":
         m = StarSpace.load(args.model)
-        n, prec, rec = m.test(iter_lines(args.test_file), k=args.k)
+        n, prec, rec = m.test(args.test_file, k=args.k)
         print(f"N\t{n}")
         print(f"P@{args.k}\t{prec:.4f}")
         print(f"R@{args.k}\t{rec:.4f}")

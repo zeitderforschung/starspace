@@ -434,41 +434,44 @@ def _train_epoch(emb, adagrad, buf, buf_len,
             if is_nl:
                 # ── process complete line ──
                 if mode == 5:
-                    for wi in range(nw_line):
-                        cs = max(np.int32(0), wi - np.int32(ws))
-                        ce = min(nw_line, wi + np.int32(ws) + np.int32(1))
-                        n_ctx_words = np.int32(0)
-                        for ci in range(cs, ce):
-                            if ci != wi:
-                                ctx_wids_tmp[n_ctx_words] = line_wids[ci]
-                                ctx_whash_tmp[n_ctx_words] = line_whash[ci]
-                                n_ctx_words += 1
-                        if n_ctx_words == 0:
-                            continue
-                        n_ctx = _build_word_ctx(
-                            ctx_wids_tmp, ctx_whash_tmp, n_ctx_words,
-                            word_ngrams, bucket, ngram_base, ctx_buf)
-                        target_buf[0] = line_wids[wi]
-                        n_targets = np.int32(1)
+                    # Update progress once per line (matches native C++
+                    # which decays LR per sample/line, not per word-pair)
+                    tok_count += np.int64(nw_line)
+                    progress = np.float64(tok_count) / np.float64(
+                        total_tokens)
+                    cur_lr = np.float32(
+                        np.float64(base_lr) * (1.0 - progress))
+                    if cur_lr <= np.float32(0.0):
+                        done = True
 
-                        tok_count += np.int64(n_ctx_words)
-                        progress = np.float64(tok_count) / np.float64(
-                            total_tokens)
-                        cur_lr = np.float32(
-                            np.float64(base_lr) * (1.0 - progress))
-                        if cur_lr <= np.float32(0.0):
-                            done = True
-                            break
+                    if not done and nw_line > 0:
+                        for wi in range(nw_line):
+                            cs = max(np.int32(0), wi - np.int32(ws))
+                            ce = min(nw_line, wi + np.int32(ws) + np.int32(1))
+                            n_ctx_words = np.int32(0)
+                            for ci in range(cs, ce):
+                                if ci != wi:
+                                    ctx_wids_tmp[n_ctx_words] = line_wids[ci]
+                                    ctx_whash_tmp[n_ctx_words] = line_whash[ci]
+                                    n_ctx_words += 1
+                            if n_ctx_words == 0:
+                                continue
+                            n_ctx = _build_word_ctx(
+                                ctx_wids_tmp, ctx_whash_tmp, n_ctx_words,
+                                word_ngrams, bucket, ngram_base, ctx_buf)
+                            target_buf[0] = line_wids[wi]
+                            n_targets = np.int32(1)
 
-                        loss, rng_state = _train_step(
-                            emb, adagrad,
-                            ctx_buf, n_ctx, target_buf, n_targets,
-                            lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
-                            neg_ids, neg_flags,
-                            dim, nwords, nlabels, margin, neg_search_limit,
-                            cur_lr, rng_state, norm_limit, mode)
-                        loss_sum += loss
-                        n_steps += 1
+                            loss, rng_state = _train_step(
+                                emb, adagrad,
+                                ctx_buf, n_ctx, target_buf, n_targets,
+                                lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
+                                neg_ids, neg_flags,
+                                dim, nwords, nlabels, margin,
+                                neg_search_limit,
+                                cur_lr, rng_state, norm_limit, mode)
+                            loss_sum += loss
+                            n_steps += 1
 
                 else:
                     # modes 0-4

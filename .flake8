@@ -1,0 +1,25 @@
+[flake8]
+# Global flake8 configuration for StarSpace project
+
+# Ignore:
+#   E501 - line too long (we prioritize readability over strict 79-char limit)
+#   E221 - multiple spaces before operator (intentional alignment in array initialization)
+#   F841 - unused variables (debug variables in training loops, kept for diagnostics)
+extend-ignore = E501,E221,F841
+
+# Maximum line length (informational, not enforced due to E501 ignore)
+max-line-length = 120
+
+# Exclude directories
+exclude =
+    .git,
+    __pycache__,
+    .pytest_cache,
+    *.egg-info,
+    build,
+    dist,
+    src
+
+# Per-file ignores (if needed in future)
+# per-file-ignores =
+#     test_*.py:E402

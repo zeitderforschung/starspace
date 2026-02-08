@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+/starspace
+
+# Python
+__pycache__/
+*.pyc
+
+# Last.FM dataset
+data/lastfm/*.zip

@@ -210,7 +210,7 @@ def _build_word_ctx(wids, whash, nw, word_ngrams, bucket,
 
 
 @njit(fastmath=True, cache=True)
-def _train_step(emb, adagrad,
+def _train_step(emb, adagrad_lhs, adagrad_rhs,
                 ctx_buf, n_ctx, target_buf, n_targets,
                 lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
                 neg_ids, neg_flags,
@@ -220,6 +220,7 @@ def _train_step(emb, adagrad,
     """One hinge-loss + neg-sampling + AdaGrad step.
 
     Matches native C++ StarSpace gradient computation:
+    - Separate LHS/RHS AdaGrad accumulators (LHSUpdates_ / RHSUpdates_)
     - LHS AdaGrad weight: ||gradW||^2 / dim
     - RHS positive rate: cur_lr (full learning rate)
     - RHS negative rate: cur_lr / num_violated_negs
@@ -328,29 +329,29 @@ def _train_step(emb, adagrad,
     for d in range(dim):
         lhs_norm_sq += lhs_vec[d] * lhs_vec[d]
 
-    # update LHS (AdaGrad) — rate = cur_lr, weight = ||gradW||^2
+    # update LHS (AdaGrad with LHSUpdates_) — rate = cur_lr, weight = ||gradW||^2
     for k in range(n_ctx):
         row = ctx_buf[k]
-        adagrad[row] += grad_norm_sq / np.float32(dim)
-        eff = cur_lr / np.float32(np.sqrt(np.float64(adagrad[row]) + 1e-6))
+        adagrad_lhs[row] += grad_norm_sq / np.float32(dim)
+        eff = cur_lr / np.float32(np.sqrt(np.float64(adagrad_lhs[row]) + 1e-6))
         for d in range(dim):
             emb[row, d] -= eff * grad_w[d]
 
-    # update RHS positive (AdaGrad) — rate = cur_lr, weight = ||lhs||^2
+    # update RHS positive (AdaGrad with RHSUpdates_) — rate = cur_lr, weight = ||lhs||^2
     for t in range(n_targets):
         tgt = target_buf[t]
-        adagrad[tgt] += lhs_norm_sq / np.float32(dim)
-        eff = cur_lr / np.float32(np.sqrt(np.float64(adagrad[tgt]) + 1e-6))
+        adagrad_rhs[tgt] += lhs_norm_sq / np.float32(dim)
+        eff = cur_lr / np.float32(np.sqrt(np.float64(adagrad_rhs[tgt]) + 1e-6))
         for d in range(dim):
             emb[tgt, d] += eff * lhs_vec[d]
 
-    # update RHS negatives (AdaGrad) — rate = cur_lr / n_valid per neg
+    # update RHS negatives (AdaGrad with RHSUpdates_) — rate = cur_lr / n_valid per neg
     nr = cur_lr / np.float32(n_valid)
     for ni in range(n_tested):
         if neg_flags[ni] == np.int32(1):
             nl = neg_ids[ni]
-            adagrad[nl] += lhs_norm_sq / np.float32(dim)
-            eff = nr / np.float32(np.sqrt(np.float64(adagrad[nl]) + 1e-6))
+            adagrad_rhs[nl] += lhs_norm_sq / np.float32(dim)
+            eff = nr / np.float32(np.sqrt(np.float64(adagrad_rhs[nl]) + 1e-6))
             for d in range(dim):
                 emb[nl, d] -= eff * lhs_vec[d]
 
@@ -415,7 +416,7 @@ def _find_line_offsets(buf, buf_len):
 # ── training epoch (retokenises from mmap each pass) ─────────────────────────
 
 @njit(fastmath=True, cache=True)
-def _train_epoch(emb, adagrad, buf, buf_len,
+def _train_epoch(emb, adagrad_lhs, adagrad_rhs, buf, buf_len,
                  ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
                  table_mask, remap,
                  nwords, nlabels, dim, word_ngrams, bucket,
@@ -521,7 +522,7 @@ def _train_epoch(emb, adagrad, buf, buf_len,
             if nw_line > 0:
                 for wi in range(nw_line):
                     cs = max(np.int32(0), wi - np.int32(ws))
-                    ce = min(nw_line, wi + np.int32(ws) + np.int32(1))
+                    ce = min(nw_line, wi + np.int32(ws))
                     n_ctx_words = np.int32(0)
                     for ci in range(cs, ce):
                         if ci != wi:
@@ -537,7 +538,7 @@ def _train_epoch(emb, adagrad, buf, buf_len,
                     n_targets = np.int32(1)
 
                     loss, rng_state = _train_step(
-                        emb, adagrad,
+                        emb, adagrad_lhs, adagrad_rhs,
                         ctx_buf, n_ctx, target_buf, n_targets,
                         lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
                         neg_ids, neg_flags,
@@ -647,7 +648,7 @@ def _train_epoch(emb, adagrad, buf, buf_len,
                 if cur_lr <= np.float32(0.0):
                     break
                 loss, rng_state = _train_step(
-                    emb, adagrad,
+                    emb, adagrad_lhs, adagrad_rhs,
                     ctx_buf, n_ctx, target_buf, n_targets,
                     lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
                     neg_ids, neg_flags,
@@ -1068,7 +1069,9 @@ class StarSpace:
              mask, remap, neg_pool):
         v = self.vocab
         rng_state = np.int64(self.seed + 1)
-        adagrad = np.zeros(self.emb.shape[0], np.float32)
+        # separate LHS/RHS AdaGrad accumulators (matches native LHSUpdates_ / RHSUpdates_)
+        adagrad_lhs = np.zeros(self.emb.shape[0], np.float32)
+        adagrad_rhs = np.zeros(self.emb.shape[0], np.float32)
         loss_acc, n_acc = 0.0, 0
         t0 = time.time()
 
@@ -1088,7 +1091,7 @@ class StarSpace:
             finish_rate = max(epoch_rate - decr_per_epoch, 0.0)
 
             loss, steps, rng_state = _train_epoch(
-                self.emb, adagrad, buf, buf_len,
+                self.emb, adagrad_lhs, adagrad_rhs, buf, buf_len,
                 ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
                 mask, remap,
                 np.int32(v.nwords), np.int32(v.nlabels), np.int32(self.dim),

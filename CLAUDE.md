@@ -29,26 +29,26 @@ All 8 tests must pass (modes 0-5, file input, iter_lines input).
 
 ## Architecture: starspace.py
 
-### Pipeline (no temp files)
+### Pipeline (retokenise-per-epoch, no intermediate arrays)
 
 Training operates directly on a memory-mapped text file:
 
-1. **Pass 1** `_vocab_scan` (Numba `@njit`): Scans mmap'd `uint8` bytes → open-addressing hash table + line byte offsets. FNV-1a hashing, `__label__` prefix detection, frequency counting. Returns status for hash table overflow handling.
+1. **Pass 1** `_vocab_scan` (Numba `@njit`): Scans mmap'd `uint8` bytes → open-addressing hash table. FNV-1a hashing, `__label__` prefix detection, frequency counting. Returns status for hash table overflow handling.
 
 2. **Pass 2** `_extract_vocab` (Python): Filters words by `min_count`, sorts by frequency descending, assigns final embedding IDs, builds remap array. Reconstructs Python strings from byte offsets for the `Vocab` dataclass.
 
-3. **Pass 3** `_build_training` (Numba `@njit`): Re-scans mmap'd bytes, tokenizes with hash table lookup + remap, applies mode-specific LHS/RHS logic, fills 8 in-memory arrays (ids, hashes, labels, extra, offsets × 3, neg_pool).
-
-4. **Train** `_train_epoch` (Numba `@njit`): Hinge loss + cosine similarity + AdaGrad on the in-memory arrays. One call per epoch.
+3. **Train** `_train_epoch` (Numba `@njit`): Retokenises from mmap each epoch — scans bytes, looks up tokens in hash table via `_lookup_token`, builds LHS context via `_build_word_ctx`, trains inline via `_train_step`. No intermediate arrays stored between passes.
 
 ### Key functions
 
 | Function | Type | Purpose |
 |---|---|---|
 | `_fnv1a_bytes(data)` | `@njit` | FNV-1a 32-bit hash (matches C++ StarSpace/fastText) |
-| `_vocab_scan(buf, ...)` | `@njit` | Pass 1: mmap bytes → hash table + line offsets |
-| `_build_training(buf, ...)` | `@njit` | Pass 3: mmap bytes → in-memory training arrays |
-| `_train_epoch(emb, ...)` | `@njit` | Training kernel (hinge loss, AdaGrad) |
+| `_vocab_scan(buf, ...)` | `@njit` | Pass 1: mmap bytes → hash table |
+| `_lookup_token(buf, ...)` | `@njit` | Hash table lookup for one token → (id, fnv) |
+| `_build_word_ctx(wids, ...)` | `@njit` | Build LHS context: word IDs + n-gram buckets |
+| `_train_step(emb, ...)` | `@njit` | One hinge-loss + neg-sampling + AdaGrad step |
+| `_train_epoch(emb, ...)` | `@njit` | Scan mmap, tokenise, mode dispatch, call helpers |
 | `_alloc_hash_table(n)` | Python | Allocate struct-of-arrays hash table |
 | `_extract_vocab(buf, ...)` | Python | Pass 2: hash table → Vocab + remap |
 
@@ -77,6 +77,17 @@ Struct-of-arrays with open addressing (linear probing):
 - Collision handling: FNV match + length match + byte-by-byte comparison
 - Load factor threshold: 70% triggers overflow → Python doubles size and retries
 
+### Memory footprint (10 GB text file, ~5 M unique words, dim=100)
+
+```
+text mmap        0 B  (OS pages from disk)
+hash table    ~600 MB  (6 arrays × ~20 M slots)
+remap          ~80 MB
+embeddings   ~2.8 GB  ((5 M + labels + buckets) × 100 × 4)
+adagrad       ~28 MB
+total        ~3.5 GB  — the text is never copied into RAM
+```
+
 ### API
 
 ```python
@@ -93,3 +104,4 @@ model = StarSpace.load("model.npz")
 - Only numpy and numba as dependencies
 - All 6 training modes must work
 - File-based training preferred (iterables spill to temp file)
+- All `@njit` helpers must be top-level functions (Numba doesn't support closures)

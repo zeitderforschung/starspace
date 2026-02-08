@@ -79,13 +79,19 @@ Struct-of-arrays with open addressing (linear probing):
 
 ### Memory footprint (10 GB text file, ~5 M unique words, dim=100)
 
+Hash table is 33.5 M slots (power-of-2 ≥ 5M × 4). After Pass 2, `ht_freq` (268 MB)
+and `ht_is_label` (33.5 MB) are deleted — only the 4 arrays needed by `_lookup_token`
+during retokenisation are kept. No intermediate training arrays are stored.
+
 ```
-text mmap        0 B  (OS pages from disk)
-hash table    ~600 MB  (6 arrays × ~20 M slots)
-remap          ~80 MB
-embeddings   ~2.8 GB  ((5 M + labels + buckets) × 100 × 4)
-adagrad       ~28 MB
-total        ~3.5 GB  — the text is never copied into RAM
+text mmap          0 B   OS pages from disk, not RAM
+hash table      570 MB   4 kept arrays × 33.5 M slots (fnv/occ/tok_start/tok_len)
+remap           134 MB   table_size × int32
+embeddings    2,800 MB   (5 M + labels + 2 M buckets) × 100 × float32
+adagrad          28 MB   n_emb × float32
+epoch scratch  ~320 KB   line buffers, ctx_buf, vectors (negligible)
+─────────────────────
+total         ~3.5 GB    the text is never copied into RAM
 ```
 
 ### API

@@ -14,7 +14,7 @@ make BOOST_DIR=/usr/include opt    # native C++ binary (for comparison)
 ```
 starspace.py              — Pure Python StarSpace (numpy + numba), all 6 modes
 test_starspace_modes.py   — Test suite (modes 0-5, file I/O, save/load)
-starspace.md              — Algorithm notes
+test_native_compare.py    — Cross-validation vs native C++ (modes 0-5)
 src/                      — Original C++ StarSpace source
 makefile                  — C++ build (use BOOST_DIR=/usr/include)
 ```
@@ -104,6 +104,19 @@ model.test("test.txt", k=1)            # → (N, precision@k, recall@k)
 model.save("model.npz")
 model = StarSpace.load("model.npz")
 ```
+
+### Native C++ alignment
+
+The Python implementation matches native C++ StarSpace behavior:
+- **Gradient rates**: LHS AdaGrad uses `||gradW||²/dim`, RHS positive rate = `lr`, RHS negative rate = `lr/num_violated_negs`
+- **maxNegSamples cap**: Default 10, matching native `args_->maxNegSamples`
+- **LR schedule**: Stepwise decay every 1000 samples within each epoch, epoch-level decay from `lr` to ~1e-9
+- **Per-epoch line shuffling**: Fisher-Yates shuffle on line offsets
+- **Negative sampling**: Frequency-weighted pool (proportional to corpus frequency, matching native `getRandomRHS`/`getRandomWord`)
+
+Known differences from native:
+- **Batch size**: Native default 5 (shared negatives), Python uses 1 (per-example SGD)
+- **Mode 2 negatives**: Native returns multi-label negatives (all labels from random example minus one), Python samples single labels
 
 ### Constraints
 

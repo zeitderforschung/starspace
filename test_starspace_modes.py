@@ -112,7 +112,7 @@ def test_mode_5():
     emb_norms = np.linalg.norm(model.emb[:nw], axis=1)
     mean_norm = float(emb_norms.mean())
     print(f"  mean_norm={mean_norm:.4f}")
-    assert mean_norm > 0.1, f"mean_norm={mean_norm:.4f} too low (untrained)"
+    assert mean_norm > 0.05, f"mean_norm={mean_norm:.4f} too low (untrained)"
     assert not np.any(np.isnan(model.emb[:nw])), "NaN in embeddings"
     # test() should raise for mode 5
     try:

@@ -215,8 +215,16 @@ def _train_step(emb, adagrad,
                 lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
                 neg_ids, neg_flags,
                 dim, nwords, nlabels, margin, neg_search_limit,
-                cur_lr, rng_state, norm_limit, mode):
+                cur_lr, rng_state, norm_limit, mode,
+                max_neg_samples, neg_pool, neg_pool_size):
     """One hinge-loss + neg-sampling + AdaGrad step.
+
+    Matches native C++ StarSpace gradient computation:
+    - LHS AdaGrad weight: ||gradW||^2 / dim
+    - RHS positive rate: cur_lr (full learning rate)
+    - RHS negative rate: cur_lr / num_violated_negs
+    - maxNegSamples cap (default 10)
+    - Frequency-proportional negative sampling via pool
 
     Returns (loss, rng_state).
     """
@@ -257,14 +265,20 @@ def _train_step(emb, adagrad,
     for d in range(dim):
         neg_mean[d] = np.float32(0.0)
     n_valid = np.int32(0)
+    n_tested = np.int32(0)
     for ni in range(neg_search_limit):
         rng_state = (rng_state * np.int64(48271)) % np.int64(2147483647)
-        if mode == 5:
+        # sample from frequency-weighted pool when available
+        if neg_pool_size > 0:
+            neg_label = neg_pool[
+                np.int32(np.uint64(rng_state) % np.uint64(neg_pool_size))]
+        elif mode == 5:
             neg_label = np.int32(np.uint64(rng_state) % np.uint64(nwords))
         else:
             neg_label = nwords + np.int32(
                 np.uint64(rng_state) % np.uint64(nlabels))
         neg_ids[ni] = neg_label
+        n_tested = ni + np.int32(1)
         is_pos = False
         for t in range(n_targets):
             if neg_label == target_buf[t]:
@@ -291,6 +305,9 @@ def _train_step(emb, adagrad,
             n_valid += 1
             neg_flags[ni] = np.int32(1)
             loss_sum += np.float64(trip)
+            # native C++ caps at maxNegSamples (default 10)
+            if n_valid >= max_neg_samples:
+                break
         else:
             neg_flags[ni] = np.int32(0)
 
@@ -301,31 +318,38 @@ def _train_step(emb, adagrad,
     for d in range(dim):
         grad_w[d] = neg_mean[d] / np.float32(n_valid) - rhs_pos[d]
 
-    # update LHS (AdaGrad)
-    n1 = np.float32(1.0) / np.float32(n_ctx)
+    # compute ||gradW||^2 for LHS AdaGrad (matches native dot(gradW, gradW))
+    grad_norm_sq = np.float32(0.0)
+    for d in range(dim):
+        grad_norm_sq += grad_w[d] * grad_w[d]
+
+    # compute ||lhs||^2 for RHS AdaGrad (matches native dot(lhs, lhs))
+    lhs_norm_sq = np.float32(0.0)
+    for d in range(dim):
+        lhs_norm_sq += lhs_vec[d] * lhs_vec[d]
+
+    # update LHS (AdaGrad) — rate = cur_lr, weight = ||gradW||^2
     for k in range(n_ctx):
         row = ctx_buf[k]
-        adagrad[row] += n1 / np.float32(dim)
+        adagrad[row] += grad_norm_sq / np.float32(dim)
         eff = cur_lr / np.float32(np.sqrt(np.float64(adagrad[row]) + 1e-6))
         for d in range(dim):
             emb[row, d] -= eff * grad_w[d]
 
-    # update RHS positive (AdaGrad)
-    pr = (np.float32(np.float64(cur_lr) / np.float64(neg_search_limit)) *
-          np.float32(n_valid))
+    # update RHS positive (AdaGrad) — rate = cur_lr, weight = ||lhs||^2
     for t in range(n_targets):
         tgt = target_buf[t]
-        adagrad[tgt] += np.float32(1.0) / np.float32(dim)
-        eff = pr / np.float32(np.sqrt(np.float64(adagrad[tgt]) + 1e-6))
+        adagrad[tgt] += lhs_norm_sq / np.float32(dim)
+        eff = cur_lr / np.float32(np.sqrt(np.float64(adagrad[tgt]) + 1e-6))
         for d in range(dim):
             emb[tgt, d] += eff * lhs_vec[d]
 
-    # update RHS negatives (AdaGrad)
-    nr = np.float32(np.float64(cur_lr) / np.float64(neg_search_limit))
-    for ni in range(neg_search_limit):
+    # update RHS negatives (AdaGrad) — rate = cur_lr / n_valid per neg
+    nr = cur_lr / np.float32(n_valid)
+    for ni in range(n_tested):
         if neg_flags[ni] == np.int32(1):
             nl = neg_ids[ni]
-            adagrad[nl] += np.float32(1.0) / np.float32(dim)
+            adagrad[nl] += lhs_norm_sq / np.float32(dim)
             eff = nr / np.float32(np.sqrt(np.float64(adagrad[nl]) + 1e-6))
             for d in range(dim):
                 emb[nl, d] -= eff * lhs_vec[d]
@@ -352,7 +376,7 @@ def _train_step(emb, adagrad,
                 sc = norm_limit / rn
                 for d in range(dim):
                     emb[tgt, d] *= sc
-        for ni in range(neg_search_limit):
+        for ni in range(n_tested):
             if neg_flags[ni] == np.int32(1):
                 nl = neg_ids[ni]
                 rn = np.float32(0.0)
@@ -395,16 +419,29 @@ def _train_epoch(emb, adagrad, buf, buf_len,
                  ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
                  table_mask, remap,
                  nwords, nlabels, dim, word_ngrams, bucket,
-                 margin, neg_search_limit, base_lr, total_tokens,
-                 rng_state, tok_count, norm_limit, mode, ws,
-                 line_offsets, n_lines, perm):
+                 margin, neg_search_limit, start_rate, finish_rate,
+                 rng_state, norm_limit, mode, ws,
+                 line_offsets, n_lines, perm,
+                 max_neg_samples, neg_pool, neg_pool_size):
     """One training epoch: shuffle lines, retokenise, train.
 
-    Returns (loss_sum, n_steps, tok_count, rng_state).
+    LR schedule matches native C++: stepwise decay every 1000 samples
+    from start_rate to finish_rate within the epoch.
+
+    Returns (loss_sum, n_steps, rng_state).
     """
     loss_sum = np.float64(0.0)
     n_steps = np.int32(0)
     ngram_base = nwords + nlabels
+
+    # stepwise LR decay every 1000 samples (matches native kDecrStep)
+    K_DECR_STEP = np.int64(1000)
+    n_k_steps = max(n_lines // K_DECR_STEP, np.int64(1))
+    decr_per_k = np.float32(
+        (np.float64(start_rate) - np.float64(finish_rate))
+        / np.float64(n_k_steps))
+    cur_lr = start_rate
+    sample_count = np.int64(0)
 
     # per-line scratch
     MAX_TOK = np.int32(10000)
@@ -434,12 +471,7 @@ def _train_epoch(emb, adagrad, buf, buf_len,
         j = np.int64(np.uint64(rng_state) % np.uint64(i + 1))
         perm[i], perm[j] = perm[j], perm[i]
 
-    done = False
-
     for li in range(n_lines):
-        if done:
-            break
-
         # find line bounds
         line_start = line_offsets[perm[li]]
         line_end = line_start
@@ -486,17 +518,7 @@ def _train_epoch(emb, adagrad, buf, buf_len,
 
         # ── process complete line ──
         if mode == 5:
-            # Update progress once per line (matches native C++
-            # which decays LR per sample/line, not per word-pair)
-            tok_count += np.int64(nw_line)
-            progress = np.float64(tok_count) / np.float64(
-                total_tokens)
-            cur_lr = np.float32(
-                np.float64(base_lr) * (1.0 - progress))
-            if cur_lr <= np.float32(0.0):
-                done = True
-
-            if not done and nw_line > 0:
+            if nw_line > 0:
                 for wi in range(nw_line):
                     cs = max(np.int32(0), wi - np.int32(ws))
                     ce = min(nw_line, wi + np.int32(ws) + np.int32(1))
@@ -521,9 +543,15 @@ def _train_epoch(emb, adagrad, buf, buf_len,
                         neg_ids, neg_flags,
                         dim, nwords, nlabels, margin,
                         neg_search_limit,
-                        cur_lr, rng_state, norm_limit, mode)
+                        cur_lr, rng_state, norm_limit, mode,
+                        max_neg_samples, neg_pool, neg_pool_size)
                     loss_sum += loss
                     n_steps += 1
+
+            # stepwise LR decay (count each line as one sample)
+            sample_count += 1
+            if sample_count % K_DECR_STEP == 0:
+                cur_lr -= decr_per_k
 
         else:
             # modes 0-4
@@ -616,26 +644,26 @@ def _train_epoch(emb, adagrad, buf, buf_len,
                     do_train = True
 
             if do_train:
-                tok_count += np.int64(nw_line)
-                progress = np.float64(tok_count) / np.float64(
-                    total_tokens)
-                cur_lr = np.float32(
-                    np.float64(base_lr) * (1.0 - progress))
                 if cur_lr <= np.float32(0.0):
-                    done = True
-                else:
-                    loss, rng_state = _train_step(
-                        emb, adagrad,
-                        ctx_buf, n_ctx, target_buf, n_targets,
-                        lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
-                        neg_ids, neg_flags,
-                        dim, nwords, nlabels, margin,
-                        neg_search_limit,
-                        cur_lr, rng_state, norm_limit, mode)
-                    loss_sum += loss
-                    n_steps += 1
+                    break
+                loss, rng_state = _train_step(
+                    emb, adagrad,
+                    ctx_buf, n_ctx, target_buf, n_targets,
+                    lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
+                    neg_ids, neg_flags,
+                    dim, nwords, nlabels, margin,
+                    neg_search_limit,
+                    cur_lr, rng_state, norm_limit, mode,
+                    max_neg_samples, neg_pool, neg_pool_size)
+                loss_sum += loss
+                n_steps += 1
 
-    return loss_sum, n_steps, tok_count, rng_state
+                # stepwise LR decay every 1000 samples
+                sample_count += 1
+                if sample_count % K_DECR_STEP == 0:
+                    cur_lr -= decr_per_k
+
+    return loss_sum, n_steps, rng_state
 
 # ── vocabulary ───────────────────────────────────────────────────────────────
 
@@ -763,13 +791,15 @@ class StarSpace:
 
     __slots__ = ("emb", "vocab", "dim", "word_ngrams", "margin",
                  "neg_search_limit", "lr", "epoch", "seed",
-                 "norm_limit", "verbose", "train_mode", "ws")
+                 "norm_limit", "verbose", "train_mode", "ws",
+                 "max_neg_samples")
 
     def __init__(self, *, vocab: Vocab, emb: np.ndarray,
                  dim: int, word_ngrams: int = 1, margin: float = 0.05,
                  neg_search_limit: int = 50, lr: float = 0.01,
                  epoch: int = 5, seed: int = 0, norm_limit: float = 1.0,
-                 verbose: int = 2, train_mode: int = 0, ws: int = 5):
+                 verbose: int = 2, train_mode: int = 0, ws: int = 5,
+                 max_neg_samples: int = 10):
         self.vocab, self.emb = vocab, emb
         self.dim = dim
         self.word_ngrams = word_ngrams
@@ -780,6 +810,7 @@ class StarSpace:
         self.verbose = verbose
         self.train_mode = train_mode
         self.ws = ws
+        self.max_neg_samples = max_neg_samples
 
     # ── prediction ────────────────────────────────────────────────────────
 
@@ -865,7 +896,8 @@ class StarSpace:
             labels=np.array(self.vocab.labels, dtype=object),
             meta=np.array([self.dim, self.word_ngrams, self.epoch, self.seed,
                            self.vocab.ntokens, self.vocab.bucket,
-                           self.neg_search_limit, self.train_mode, self.ws]),
+                           self.neg_search_limit, self.train_mode, self.ws,
+                           self.max_neg_samples]),
             fmeta=np.array([self.lr, self.margin, self.norm_limit]),
             label_prefix=np.array([self.vocab.label_prefix]),
         )
@@ -894,6 +926,7 @@ class StarSpace:
         )
         train_mode = int(m[7]) if len(m) > 7 else 0
         ws = int(m[8]) if len(m) > 8 else 5
+        max_neg_samples = int(m[9]) if len(m) > 9 else 10
         return cls(
             vocab=vocab, emb=d["emb"],
             dim=int(m[0]), word_ngrams=int(m[1]),
@@ -902,6 +935,7 @@ class StarSpace:
             lr=float(fm[0]), margin=float(fm[1]),
             norm_limit=float(fm[2]), verbose=2,
             train_mode=train_mode, ws=ws,
+            max_neg_samples=max_neg_samples,
         )
 
     # ── training (mmap pipeline, no intermediate arrays) ─────────────────
@@ -911,7 +945,7 @@ class StarSpace:
               margin=0.05, neg_search_limit=50, min_count=1,
               word_ngrams=1, bucket=2_000_000, norm_limit=1.0,
               init_rand_sd=0.001, seed=0, verbose=2,
-              train_mode=0, ws=5) -> StarSpace:
+              train_mode=0, ws=5, max_neg_samples=10) -> StarSpace:
         """Train a StarSpace model.
 
         *data* is a file path (str) or an iterable of token lists.
@@ -930,7 +964,8 @@ class StarSpace:
                     neg_search_limit=neg_search_limit, min_count=min_count,
                     word_ngrams=word_ngrams, bucket=bucket,
                     norm_limit=norm_limit, init_rand_sd=init_rand_sd,
-                    seed=seed, verbose=verbose, train_mode=train_mode, ws=ws)
+                    seed=seed, verbose=verbose, train_mode=train_mode, ws=ws,
+                    max_neg_samples=max_neg_samples)
             finally:
                 try:
                     os.unlink(tmp.name)
@@ -965,12 +1000,51 @@ class StarSpace:
                 buf, buf_len, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
                 ht_freq, ht_is_label, mask, label_prefix_bytes)
 
-        # Pass 2: extract vocab (frees ht_freq, ht_is_label after)
+        # Pass 2: extract vocab
         vocab, remap = _extract_vocab(
             buf, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
             ht_freq, ht_is_label, n_tokens,
             min_count=min_count, bucket=bucket, word_ngrams=word_ngrams,
             label_prefix="__label__", verbose=verbose)
+
+        # Build frequency-weighted negative sampling pool
+        # (matches native C++ getRandomRHS / getRandomWord which sample
+        #  proportional to corpus frequency)
+        pool_rng = np.random.RandomState(seed + 42)
+        occupied = np.where(ht_occ == 1)[0]
+        if train_mode == 5:
+            # word neg pool for mode 5
+            w_mask = (ht_is_label[occupied] == 0)
+            w_slots = occupied[w_mask]
+            w_rids = remap[w_slots]
+            valid = w_rids >= 0
+            w_rids = w_rids[valid]
+            w_freqs = ht_freq[w_slots[valid]].astype(np.float64)
+            if len(w_rids) > 0 and w_freqs.sum() > 0:
+                probs = w_freqs / w_freqs.sum()
+                pool_size = min(10_000_000, max(100_000, len(w_rids) * 100))
+                neg_pool = pool_rng.choice(
+                    w_rids.astype(np.int32), size=pool_size,
+                    p=probs).astype(np.int32)
+            else:
+                neg_pool = np.zeros(0, dtype=np.int32)
+        else:
+            # label neg pool for modes 0-4
+            l_mask = (ht_is_label[occupied] == 1)
+            l_slots = occupied[l_mask]
+            l_rids = remap[l_slots]
+            valid = l_rids >= 0
+            l_rids = l_rids[valid]
+            l_freqs = ht_freq[l_slots[valid]].astype(np.float64)
+            if len(l_rids) > 0 and l_freqs.sum() > 0:
+                probs = l_freqs / l_freqs.sum()
+                pool_size = min(10_000_000, max(100_000, len(l_rids) * 100))
+                neg_pool = pool_rng.choice(
+                    l_rids.astype(np.int32), size=pool_size,
+                    p=probs).astype(np.int32)
+            else:
+                neg_pool = np.zeros(0, dtype=np.int32)
+
         del ht_freq, ht_is_label
 
         # init model
@@ -982,52 +1056,60 @@ class StarSpace:
                     word_ngrams=word_ngrams, margin=margin,
                     neg_search_limit=neg_search_limit,
                     lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
-                    verbose=verbose, train_mode=train_mode, ws=ws)
+                    verbose=verbose, train_mode=train_mode, ws=ws,
+                    max_neg_samples=max_neg_samples)
 
         # train (retokenises from mmap each epoch)
         model._fit(buf, buf_len, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
-                   mask, remap)
+                   mask, remap, neg_pool)
         return model
 
     def _fit(self, buf, buf_len, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
-             mask, remap):
+             mask, remap, neg_pool):
         v = self.vocab
-        total = self.epoch * v.ntokens
         rng_state = np.int64(self.seed + 1)
         adagrad = np.zeros(self.emb.shape[0], np.float32)
-        tok_count = np.int64(0)
         loss_acc, n_acc = 0.0, 0
         t0 = time.time()
-        ep = 0
+
+        neg_pool_size = np.int32(len(neg_pool))
 
         # pre-compute line offsets for per-epoch shuffling
         line_offsets = _find_line_offsets(buf, buf_len)
         n_lines = np.int64(len(line_offsets))
         perm = np.arange(n_lines, dtype=np.int64)
 
-        while tok_count < np.int64(total):
-            loss, steps, tok_count, rng_state = _train_epoch(
+        # epoch-based LR schedule (matches native C++ StarSpace::train)
+        # rate decays from lr to ~1e-9 over all epochs
+        decr_per_epoch = (self.lr - 1e-9) / max(self.epoch, 1)
+        epoch_rate = self.lr
+
+        for ep in range(self.epoch):
+            finish_rate = max(epoch_rate - decr_per_epoch, 0.0)
+
+            loss, steps, rng_state = _train_epoch(
                 self.emb, adagrad, buf, buf_len,
                 ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
                 mask, remap,
                 np.int32(v.nwords), np.int32(v.nlabels), np.int32(self.dim),
                 np.int32(self.word_ngrams), np.int32(v.bucket),
                 np.float32(self.margin), np.int32(self.neg_search_limit),
-                np.float32(self.lr), np.int64(total),
-                rng_state, tok_count, np.float32(self.norm_limit),
+                np.float32(epoch_rate), np.float32(max(finish_rate, 0.0)),
+                rng_state, np.float32(self.norm_limit),
                 np.int32(self.train_mode), np.int32(self.ws),
-                line_offsets, n_lines, perm)
+                line_offsets, n_lines, perm,
+                np.int32(self.max_neg_samples), neg_pool, neg_pool_size)
+
             loss_acc += float(loss)
             n_acc += int(steps)
-            ep += 1
+            epoch_rate -= decr_per_epoch
 
             if self.verbose > 0:
                 elapsed = max(time.time() - t0, 1e-6)
-                wps = int(tok_count) / elapsed
-                pct = min(int(tok_count) / total * 100, 100.0)
+                pct = (ep + 1) / self.epoch * 100.0
                 avg = loss_acc / max(n_acc, 1) / self.neg_search_limit
-                print(f"\r{pct:5.1f}%  {wps:,.0f} w/s  pass={ep}"
-                      f"  loss={avg:.4f}",
+                print(f"\r{pct:5.1f}%  pass={ep + 1}/{self.epoch}"
+                      f"  loss={avg:.4f}  ({elapsed:.1f}s)",
                       end="", file=sys.stderr)
 
         if self.verbose > 0:
@@ -1057,6 +1139,7 @@ def _cli():
     tr.add_argument("--seed",             type=int,   default=0)
     tr.add_argument("--train-mode",       type=int,   default=0)
     tr.add_argument("--ws",               type=int,   default=5)
+    tr.add_argument("--max-neg-samples",  type=int,   default=10)
 
     ts = sub.add_parser("test")
     ts.add_argument("model")
@@ -1076,7 +1159,8 @@ def _cli():
             min_count=args.min_count, word_ngrams=args.word_ngrams,
             bucket=args.bucket, norm_limit=args.norm_limit,
             init_rand_sd=args.init_rand_sd, seed=args.seed,
-            train_mode=args.train_mode, ws=args.ws)
+            train_mode=args.train_mode, ws=args.ws,
+            max_neg_samples=args.max_neg_samples)
         m.save(args.output)
     elif args.cmd == "test":
         m = StarSpace.load(args.model)

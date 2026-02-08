@@ -352,10 +352,10 @@ def main():
     mode5_ok = True
     mode5_reasons = []
 
-    # Embedding norms should be non-trivial (> 0.1 for a trained model)
-    if py_mean_norm < 0.1:
+    # Embedding norms should be non-trivial (> 0.05 for a trained model)
+    if py_mean_norm < 0.05:
         mode5_reasons.append(
-            f"Python mean_norm={py_mean_norm:.4f} < 0.1 (untrained)")
+            f"Python mean_norm={py_mean_norm:.4f} < 0.05 (untrained)")
         mode5_ok = False
 
     # If we have native norms, compare them

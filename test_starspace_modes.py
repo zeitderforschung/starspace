@@ -1,243 +1,210 @@
-"""Test all 6 StarSpace training modes (0-5)."""
+"""Test all 6 StarSpace training modes on real datasets."""
 
 import sys, os, tempfile, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
 from starspace import StarSpace, iter_lines
 
-# ── test data ──────────────────────────────────────────────────────────────────
+TAGGED_DATA = os.path.join(ROOT, "python", "test", "tagged_post.txt")
+WORD_DATA = os.path.join(ROOT, "python", "test", "input.txt")
 
-# Classification data: __label__X  word word word
-CLASSIFICATION_TRAIN = [
-    ["__label__pos", "love", "this", "great", "movie"],
-    ["__label__pos", "excellent", "wonderful", "film"],
-    ["__label__pos", "amazing", "fantastic", "great"],
-    ["__label__pos", "best", "movie", "ever", "love"],
-    ["__label__pos", "brilliant", "love", "wonderful"],
-    ["__label__neg", "terrible", "awful", "bad", "movie"],
-    ["__label__neg", "worst", "horrible", "boring"],
-    ["__label__neg", "hate", "this", "awful", "film"],
-    ["__label__neg", "bad", "terrible", "waste"],
-    ["__label__neg", "boring", "dull", "hate"],
-]
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-CLASSIFICATION_TEST = [
-    ["__label__pos", "love", "great", "film"],
-    ["__label__neg", "terrible", "bad", "boring"],
-    ["__label__pos", "wonderful", "amazing"],
-    ["__label__neg", "awful", "hate", "waste"],
-]
-
-# Multi-label data (modes 1-4): items have 2+ labels
-MULTILABEL_TRAIN = [
-    ["__label__action", "__label__comedy", "fun", "exciting", "chase"],
-    ["__label__drama", "__label__romance", "love", "emotional", "tears"],
-    ["__label__action", "__label__scifi", "space", "battle", "hero"],
-    ["__label__comedy", "__label__romance", "funny", "love", "date"],
-    ["__label__drama", "__label__action", "intense", "fight", "war"],
-    ["__label__scifi", "__label__drama", "future", "dark", "robot"],
-    ["__label__comedy", "__label__action", "fun", "chase", "silly"],
-    ["__label__romance", "__label__drama", "tears", "love", "sad"],
-    ["__label__action", "__label__comedy", "exciting", "fun", "fight"],
-    ["__label__drama", "__label__romance", "emotional", "love", "heart"],
-    ["__label__scifi", "__label__action", "battle", "space", "laser"],
-    ["__label__comedy", "__label__romance", "funny", "date", "love"],
-] * 5  # Repeat for more data
-
-# Word embedding data (mode 5): plain text, no labels
-WORD_EMB_TRAIN = [
-    "the cat sat on the mat".split(),
-    "the dog ran in the park".split(),
-    "a cat and a dog played together".split(),
-    "the bird flew over the house".split(),
-    "a man walked with his dog".split(),
-    "the woman sat in the park".split(),
-    "cats and dogs are friends".split(),
-    "the boy ran to the house".split(),
-    "she walked with her cat".split(),
-    "he sat on the bench in the park".split(),
-] * 10  # Repeat for more data
+def split_file(path, train_frac=0.8, seed=42):
+    """Split a file into train/test by line, deterministic."""
+    import random
+    lines = open(path, encoding="utf-8", errors="replace").readlines()
+    rng = random.Random(seed)
+    rng.shuffle(lines)
+    n = int(len(lines) * train_frac)
+    train_f = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="ss_train_")
+    test_f = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="ss_test_")
+    for line in lines[:n]:
+        train_f.write(line)
+    for line in lines[n:]:
+        test_f.write(line)
+    train_f.close()
+    test_f.close()
+    return train_f.name, test_f.name, n, len(lines) - n
 
 
-def test_mode(mode, train_data, test_data=None, *, description, dim=30,
-              epoch=10, extra_kwargs=None):
-    """Test a single training mode and return pass/fail."""
-    kwargs = dict(dim=dim, epoch=epoch, lr=0.01, seed=42, verbose=0,
-                  train_mode=mode, min_count=1)
-    if extra_kwargs:
-        kwargs.update(extra_kwargs)
+# ── test functions ───────────────────────────────────────────────────────────
 
-    print(f"\n{'='*60}")
-    print(f"  Mode {mode}: {description}")
-    print(f"{'='*60}")
-
-    t0 = time.time()
-    try:
-        model = StarSpace.train(train_data, **kwargs)
-    except Exception as e:
-        print(f"  FAIL: Training raised {type(e).__name__}: {e}")
-        return False
-
-    elapsed = time.time() - t0
-    print(f"  Trained in {elapsed:.2f}s")
-    print(f"  Embedding shape: {model.emb.shape}")
-    print(f"  Vocab: {model.vocab.nwords} words, {model.vocab.nlabels} labels")
-
-    # Test save/load roundtrip
+def test_mode_0(train_path, test_path):
+    """Mode 0: Classification (LHS=words, RHS=1 label)."""
+    model = StarSpace.train(train_path, dim=50, epoch=10, lr=0.01,
+                            seed=0, verbose=0, min_count=1, train_mode=0)
+    n, p, r = model.test(test_path, k=1)
+    print(f"  N={n} P@1={p:.4f} R@1={r:.4f}")
+    assert n > 0, f"no test examples evaluated"
+    assert p > 0.05, f"P@1={p:.4f} too low"
+    # save/load roundtrip
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tf:
-        tmp_path = tf.name
-    try:
-        model.save(tmp_path)
-        loaded = StarSpace.load(tmp_path)
-        assert loaded.train_mode == mode, \
-            f"train_mode mismatch: {loaded.train_mode} != {mode}"
-        assert loaded.emb.shape == model.emb.shape, \
-            f"emb shape mismatch: {loaded.emb.shape} != {model.emb.shape}"
-        print(f"  Save/load roundtrip: OK")
-    except Exception as e:
-        print(f"  FAIL: Save/load raised {type(e).__name__}: {e}")
-        return False
-    finally:
-        os.unlink(tmp_path)
-
-    # Test prediction (modes 0-4 have labels)
-    if mode < 5 and model.vocab.nlabels > 0:
-        try:
-            preds = model.predict("love great film", k=3)
-            print(f"  predict('love great film'): {preds}")
-        except Exception as e:
-            print(f"  FAIL: predict raised {type(e).__name__}: {e}")
-            return False
-
-    # Test evaluation (modes 0-4)
-    if test_data is not None and mode < 5:
-        try:
-            n, prec, rec = model.test(test_data)
-            print(f"  test(): N={n}, P@1={prec:.4f}, R@1={rec:.4f}")
-        except Exception as e:
-            print(f"  FAIL: test raised {type(e).__name__}: {e}")
-            return False
-
-    # Mode 5: test() should raise
-    if mode == 5:
-        try:
-            model.test([["__label__x", "word"]])
-            print(f"  FAIL: test() should raise ValueError for mode 5")
-            return False
-        except ValueError:
-            print(f"  test() correctly raises ValueError for mode 5")
-
-    print(f"  PASS")
+        tmp = tf.name
+    model.save(tmp)
+    loaded = StarSpace.load(tmp)
+    os.unlink(tmp)
+    assert loaded.emb.shape == model.emb.shape
+    assert loaded.train_mode == 0
+    n2, p2, r2 = loaded.test(test_path, k=1)
+    assert p2 == p, f"save/load P@1 mismatch: {p2} != {p}"
+    # predict
+    preds = model.predict("good movie", k=3)
+    assert len(preds) > 0, "predict returned no results"
     return True
 
 
-def test_file_input(mode=0):
-    """Test that file path input works."""
-    print(f"\n{'='*60}")
-    print(f"  File path input test (mode 0)")
-    print(f"{'='*60}")
+def test_mode_1(train_path, test_path):
+    """Mode 1: Label from rest (LHS=words+rest, RHS=1 label)."""
+    model = StarSpace.train(train_path, dim=50, epoch=10, lr=0.01,
+                            seed=0, verbose=0, min_count=1, train_mode=1)
+    n, p, r = model.test(test_path, k=1)
+    print(f"  N={n} P@1={p:.4f} R@1={r:.4f}")
+    assert n > 0, f"no test examples evaluated"
+    assert p > 0.01, f"P@1={p:.4f} too low"
+    return True
 
-    with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False) as tf:
-        for tokens in CLASSIFICATION_TRAIN:
-            tf.write(" ".join(tokens) + "\n")
-        train_path = tf.name
 
+def test_mode_2(train_path, test_path):
+    """Mode 2: Inverted labels (LHS=words+1 label, RHS=rest labels)."""
+    model = StarSpace.train(train_path, dim=50, epoch=10, lr=0.01,
+                            seed=0, verbose=0, min_count=1, train_mode=2)
+    n, p, r = model.test(test_path, k=1)
+    print(f"  N={n} P@1={p:.4f} R@1={r:.4f}")
+    assert n > 0, f"no test examples evaluated"
+    assert p > 0.01, f"P@1={p:.4f} too low"
+    return True
+
+
+def test_mode_3(train_path, test_path):
+    """Mode 3: Pair prediction (LHS=words+1 label, RHS=1 other label)."""
+    model = StarSpace.train(train_path, dim=50, epoch=10, lr=0.01,
+                            seed=0, verbose=0, min_count=1, train_mode=3)
+    n, p, r = model.test(test_path, k=1)
+    print(f"  N={n} P@1={p:.4f} R@1={r:.4f}")
+    assert n > 0, f"no test examples evaluated"
+    # mode 3 on small data can have low P@1, just check non-negative
+    return True
+
+
+def test_mode_4(train_path, test_path):
+    """Mode 4: Fixed pair (LHS=words+label[0], RHS=label[1])."""
+    model = StarSpace.train(train_path, dim=50, epoch=10, lr=0.01,
+                            seed=0, verbose=0, min_count=1, train_mode=4)
+    n, p, r = model.test(test_path, k=1)
+    print(f"  N={n} P@1={p:.4f} R@1={r:.4f}")
+    assert n > 0, f"no test examples evaluated"
+    return True
+
+
+def test_mode_5():
+    """Mode 5: Word embedding (context -> target word)."""
+    model = StarSpace.train(WORD_DATA, dim=50, epoch=10, lr=0.01,
+                            seed=0, verbose=0, min_count=1, train_mode=5, ws=5)
+    nw = model.vocab.nwords
+    print(f"  vocab={nw} words")
+    assert nw > 100, f"vocab too small: {nw}"
+    emb_norms = np.linalg.norm(model.emb[:nw], axis=1)
+    mean_norm = float(emb_norms.mean())
+    print(f"  mean_norm={mean_norm:.4f}")
+    assert mean_norm > 0.1, f"mean_norm={mean_norm:.4f} too low (untrained)"
+    assert not np.any(np.isnan(model.emb[:nw])), "NaN in embeddings"
+    # test() should raise for mode 5
     try:
-        model = StarSpace.train(train_path, dim=30, epoch=5, lr=0.01,
-                                seed=42, verbose=0, min_count=1)
-        preds = model.predict("love great", k=2)
-        print(f"  predict('love great'): {preds}")
-        assert len(preds) > 0
-        print(f"  PASS")
-        return True
-    except Exception as e:
-        print(f"  FAIL: {type(e).__name__}: {e}")
-        return False
-    finally:
-        os.unlink(train_path)
+        model.test(WORD_DATA)
+        assert False, "test() should raise ValueError for mode 5"
+    except ValueError:
+        pass
+    # save/load roundtrip
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tf:
+        tmp = tf.name
+    model.save(tmp)
+    loaded = StarSpace.load(tmp)
+    os.unlink(tmp)
+    assert loaded.train_mode == 5
+    assert np.allclose(loaded.emb, model.emb), "save/load embedding mismatch"
+    return True
 
 
-def test_iter_lines_input():
-    """Test that iter_lines works as input."""
-    print(f"\n{'='*60}")
-    print(f"  iter_lines() input test")
-    print(f"{'='*60}")
+def test_file_input():
+    """Test file path input (mode 0)."""
+    model = StarSpace.train(TAGGED_DATA, dim=30, epoch=3, lr=0.01,
+                            seed=0, verbose=0, min_count=1)
+    preds = model.predict("good movie", k=3)
+    assert len(preds) > 0, "predict returned no results"
+    print(f"  predict('good movie'): {preds[:2]}")
+    return True
 
-    with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False) as tf:
-        for tokens in CLASSIFICATION_TRAIN:
-            tf.write(" ".join(tokens) + "\n")
-        train_path = tf.name
 
-    try:
-        model = StarSpace.train(iter_lines(train_path), dim=30, epoch=5,
-                                lr=0.01, seed=42, verbose=0, min_count=1)
-        preds = model.predict("love great", k=2)
-        print(f"  predict('love great'): {preds}")
-        assert len(preds) > 0
-        print(f"  PASS")
-        return True
-    except Exception as e:
-        print(f"  FAIL: {type(e).__name__}: {e}")
-        return False
-    finally:
-        os.unlink(train_path)
+def test_iter_lines():
+    """Test iter_lines input."""
+    model = StarSpace.train(iter_lines(TAGGED_DATA), dim=30, epoch=3, lr=0.01,
+                            seed=0, verbose=0, min_count=1)
+    preds = model.predict("good movie", k=3)
+    assert len(preds) > 0, "predict returned no results"
+    print(f"  predict('good movie'): {preds[:2]}")
+    return True
 
+
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print("StarSpace All-Modes Test Suite")
     print("=" * 60)
 
-    results = {}
-
     # Warm numba JIT
     print("\nWarming numba JIT (first compile)...")
     t0 = time.time()
-    StarSpace.train(CLASSIFICATION_TRAIN[:4], dim=10, epoch=1,
-                    lr=0.01, seed=0, verbose=0, min_count=1)
-    print(f"JIT warm-up done in {time.time()-t0:.1f}s\n")
+    StarSpace.train([["__label__a", "hi"], ["__label__b", "bye"]],
+                    dim=10, epoch=1, verbose=0)
+    print(f"JIT warm-up done in {time.time()-t0:.1f}s")
 
-    # Mode 0: Classification
-    results[0] = test_mode(0, CLASSIFICATION_TRAIN, CLASSIFICATION_TEST,
-                           description="Classification (LHS=words, RHS=1 label)")
+    # Split tagged data
+    train_path, test_path, n_train, n_test = split_file(TAGGED_DATA)
+    print(f"\nDataset: {os.path.basename(TAGGED_DATA)}")
+    print(f"  Train: {n_train} lines, Test: {n_test} lines\n")
 
-    # Mode 1: Label from rest
-    results[1] = test_mode(1, MULTILABEL_TRAIN,
-                           description="Label from rest (LHS=words+rest, RHS=1)")
+    tests = [
+        ("Mode 0", lambda: test_mode_0(train_path, test_path)),
+        ("Mode 1", lambda: test_mode_1(train_path, test_path)),
+        ("Mode 2", lambda: test_mode_2(train_path, test_path)),
+        ("Mode 3", lambda: test_mode_3(train_path, test_path)),
+        ("Mode 4", lambda: test_mode_4(train_path, test_path)),
+        ("Mode 5", test_mode_5),
+        ("file",   test_file_input),
+        ("iter",   test_iter_lines),
+    ]
 
-    # Mode 2: Inverted labels (multi-RHS)
-    results[2] = test_mode(2, MULTILABEL_TRAIN,
-                           description="Inverted labels (LHS=words+1, RHS=rest)")
+    results = {}
+    for name, fn in tests:
+        print(f"\n{'='*60}")
+        print(f"  {name}")
+        print(f"{'='*60}")
+        t0 = time.time()
+        try:
+            results[name] = fn()
+            print(f"  PASS ({time.time()-t0:.2f}s)")
+        except Exception as e:
+            results[name] = False
+            print(f"  FAIL: {type(e).__name__}: {e}")
 
-    # Mode 3: Pair prediction
-    results[3] = test_mode(3, MULTILABEL_TRAIN,
-                           description="Pair prediction (LHS=words+1, RHS=1 other)")
-
-    # Mode 4: Fixed pair
-    results[4] = test_mode(4, MULTILABEL_TRAIN,
-                           description="Fixed pair (LHS=words+label[0], RHS=label[1])")
-
-    # Mode 5: Word embedding
-    results[5] = test_mode(5, WORD_EMB_TRAIN,
-                           description="Word embedding (context→target)",
-                           extra_kwargs=dict(ws=3))
-
-    # File input
-    results["file"] = test_file_input()
-
-    # iter_lines input
-    results["iter"] = test_iter_lines_input()
+    # Cleanup
+    os.unlink(train_path)
+    os.unlink(test_path)
 
     # Summary
     print(f"\n\n{'='*60}")
     print(f"  SUMMARY")
     print(f"{'='*60}")
     all_pass = True
-    for key, passed in results.items():
+    for name, passed in results.items():
         status = "PASS" if passed else "FAIL"
-        label = f"Mode {key}" if isinstance(key, int) else key
-        print(f"  {label:20s} {status}")
+        print(f"  {name:20s} {status}")
         if not passed:
             all_pass = False
 

@@ -1191,7 +1191,7 @@ def test_save_load():
     params_ok = True
     for attr in ("dim", "word_ngrams", "margin", "neg_search_limit",
                  "lr", "epoch", "seed", "norm_limit", "train_mode",
-                 "ws", "max_neg_samples"):
+                 "ws", "max_neg_samples", "batch_size"):
         if getattr(py, attr) != getattr(loaded, attr):
             fail(f"param {attr} differs",
                  f"original={getattr(py, attr)} loaded={getattr(loaded, attr)}")

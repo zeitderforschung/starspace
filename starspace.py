@@ -392,6 +392,245 @@ def _train_step(emb, adagrad_lhs, adagrad_rhs,
     return loss_sum, rng_state
 
 
+@njit(fastmath=True, cache=True)
+def _train_batch(emb, adagrad_lhs, adagrad_rhs,
+                 batch_ctx, batch_n_ctx, batch_tgt, batch_n_tgt,
+                 n_examples,
+                 batch_lhs, batch_rhs_pos, rhs_neg,
+                 batch_neg_mean, batch_grad_w,
+                 neg_ids, batch_neg_flags, batch_n_valid,
+                 dim, nwords, nlabels, margin, neg_search_limit,
+                 cur_lr, rng_state, norm_limit, mode,
+                 max_neg_samples, neg_pool, neg_pool_size,
+                 neg_vecs):
+    """Train one batch of examples with shared negatives.
+
+    Matches native C++ trainOneBatch (model.cpp):
+    1. Project all LHS/RHS+ in the batch
+    2. Draw negSearchLimit negatives once (shared across batch)
+    3. Per example: check each negative for hinge violation, cap maxNegSamples
+    4. Update gradients per example
+
+    Returns (loss, rng_state).
+    """
+    loss_sum = np.float64(0.0)
+
+    # ── 1. Forward pass: project all LHS and RHS+ ──
+    for ex in range(n_examples):
+        n_ctx = batch_n_ctx[ex]
+        n_tgt = batch_n_tgt[ex]
+
+        # LHS: sum + L2 normalise
+        for d in range(dim):
+            batch_lhs[ex, d] = np.float32(0.0)
+        for k in range(n_ctx):
+            row = batch_ctx[ex, k]
+            for d in range(dim):
+                batch_lhs[ex, d] += emb[row, d]
+        norm_sq = np.float32(0.0)
+        for d in range(dim):
+            norm_sq += batch_lhs[ex, d] * batch_lhs[ex, d]
+        inv = np.float32(1.0 / np.float32(
+            np.sqrt(np.float64(norm_sq)) + 1e-10))
+        for d in range(dim):
+            batch_lhs[ex, d] *= inv
+
+        # RHS+: sum + L2 normalise
+        for d in range(dim):
+            batch_rhs_pos[ex, d] = np.float32(0.0)
+        for t in range(n_tgt):
+            tgt = batch_tgt[ex, t]
+            for d in range(dim):
+                batch_rhs_pos[ex, d] += emb[tgt, d]
+        norm_sq = np.float32(0.0)
+        for d in range(dim):
+            norm_sq += batch_rhs_pos[ex, d] * batch_rhs_pos[ex, d]
+        inv = np.float32(1.0 / np.float32(
+            np.sqrt(np.float64(norm_sq)) + 1e-10))
+        for d in range(dim):
+            batch_rhs_pos[ex, d] *= inv
+
+    # ── 2. Draw negatives once (shared across batch) ──
+    for ni in range(neg_search_limit):
+        rng_state = (rng_state * np.int64(48271)) % np.int64(2147483647)
+        if neg_pool_size > 0:
+            neg_label = neg_pool[
+                np.int32(np.uint64(rng_state) % np.uint64(neg_pool_size))]
+        elif mode == 5:
+            neg_label = np.int32(np.uint64(rng_state) % np.uint64(nwords))
+        else:
+            neg_label = nwords + np.int32(
+                np.uint64(rng_state) % np.uint64(nlabels))
+        neg_ids[ni] = neg_label
+
+        # project negative: L2 normalise
+        norm_sq2 = np.float32(0.0)
+        for d in range(dim):
+            neg_vecs[ni, d] = emb[neg_label, d]
+            norm_sq2 += neg_vecs[ni, d] * neg_vecs[ni, d]
+        inv2 = np.float32(
+            1.0 / np.float32(np.sqrt(np.float64(norm_sq2)) + 1e-10))
+        for d in range(dim):
+            neg_vecs[ni, d] *= inv2
+
+    # ── 3. Per-example: compute loss and gradients ──
+    total_loss = np.float64(0.0)
+    any_update = False
+
+    for ex in range(n_examples):
+        n_tgt = batch_n_tgt[ex]
+
+        # posSim
+        pos_sim = np.float32(0.0)
+        for d in range(dim):
+            pos_sim += batch_lhs[ex, d] * batch_rhs_pos[ex, d]
+
+        for d in range(dim):
+            batch_neg_mean[ex, d] = np.float32(0.0)
+        batch_n_valid[ex] = np.int32(0)
+
+        for ni in range(neg_search_limit):
+            nl = neg_ids[ni]
+            # skip if neg == any positive target
+            is_pos = False
+            for t in range(n_tgt):
+                if nl == batch_tgt[ex, t]:
+                    is_pos = True
+                    break
+            if is_pos:
+                batch_neg_flags[ex, ni] = np.int32(0)
+                continue
+
+            neg_sim = np.float32(0.0)
+            for d in range(dim):
+                neg_sim += batch_lhs[ex, d] * neg_vecs[ni, d]
+            trip = margin - pos_sim + neg_sim
+
+            if trip > np.float32(0.0):
+                for d in range(dim):
+                    batch_neg_mean[ex, d] += neg_vecs[ni, d]
+                batch_n_valid[ex] += np.int32(1)
+                batch_neg_flags[ex, ni] = np.int32(1)
+                loss_sum += np.float64(trip)
+                if batch_n_valid[ex] >= max_neg_samples:
+                    # zero out remaining flags
+                    for ni2 in range(ni + 1, neg_search_limit):
+                        batch_neg_flags[ex, ni2] = np.int32(0)
+                    break
+            else:
+                batch_neg_flags[ex, ni] = np.int32(0)
+
+        nv = batch_n_valid[ex]
+        if nv == 0:
+            continue
+
+        any_update = True
+        ex_loss = np.float64(0.0)
+        # (loss already accumulated above)
+
+        # gradW = mean(negs) - rhs_pos
+        for d in range(dim):
+            batch_grad_w[ex, d] = (batch_neg_mean[ex, d]
+                                   / np.float32(nv)
+                                   - batch_rhs_pos[ex, d])
+
+    if not any_update:
+        return loss_sum, rng_state
+
+    # ── 4. Backward pass: update per example ──
+    for ex in range(n_examples):
+        nv = batch_n_valid[ex]
+        if nv == 0:
+            continue
+
+        n_ctx = batch_n_ctx[ex]
+        n_tgt = batch_n_tgt[ex]
+
+        # ||gradW||^2 for LHS AdaGrad
+        grad_norm_sq = np.float32(0.0)
+        for d in range(dim):
+            grad_norm_sq += batch_grad_w[ex, d] * batch_grad_w[ex, d]
+
+        # ||lhs||^2 for RHS AdaGrad
+        lhs_norm_sq = np.float32(0.0)
+        for d in range(dim):
+            lhs_norm_sq += batch_lhs[ex, d] * batch_lhs[ex, d]
+
+        # update LHS
+        for k in range(n_ctx):
+            row = batch_ctx[ex, k]
+            adagrad_lhs[row] += grad_norm_sq / np.float32(dim)
+            eff = cur_lr / np.float32(
+                np.sqrt(np.float64(adagrad_lhs[row]) + 1e-6))
+            for d in range(dim):
+                emb[row, d] -= eff * batch_grad_w[ex, d]
+
+        # update RHS positive
+        for t in range(n_tgt):
+            tgt = batch_tgt[ex, t]
+            adagrad_rhs[tgt] += lhs_norm_sq / np.float32(dim)
+            eff = cur_lr / np.float32(
+                np.sqrt(np.float64(adagrad_rhs[tgt]) + 1e-6))
+            for d in range(dim):
+                emb[tgt, d] += eff * batch_lhs[ex, d]
+
+        # update RHS negatives
+        nr = cur_lr / np.float32(nv)
+        for ni in range(neg_search_limit):
+            if batch_neg_flags[ex, ni] == np.int32(1):
+                nl = neg_ids[ni]
+                adagrad_rhs[nl] += lhs_norm_sq / np.float32(dim)
+                eff = nr / np.float32(
+                    np.sqrt(np.float64(adagrad_rhs[nl]) + 1e-6))
+                for d in range(dim):
+                    emb[nl, d] -= eff * batch_lhs[ex, d]
+
+    # norm clipping for all modified rows
+    if norm_limit > np.float32(0.0):
+        for ex in range(n_examples):
+            if batch_n_valid[ex] == 0:
+                continue
+            for k in range(batch_n_ctx[ex]):
+                row = batch_ctx[ex, k]
+                rn = np.float32(0.0)
+                for d in range(dim):
+                    rn += emb[row, d] * emb[row, d]
+                rn = np.float32(np.sqrt(np.float64(rn)))
+                if rn > norm_limit:
+                    sc = norm_limit / rn
+                    for d in range(dim):
+                        emb[row, d] *= sc
+            for t in range(batch_n_tgt[ex]):
+                tgt = batch_tgt[ex, t]
+                rn = np.float32(0.0)
+                for d in range(dim):
+                    rn += emb[tgt, d] * emb[tgt, d]
+                rn = np.float32(np.sqrt(np.float64(rn)))
+                if rn > norm_limit:
+                    sc = norm_limit / rn
+                    for d in range(dim):
+                        emb[tgt, d] *= sc
+        # clip neg rows (shared across batch, clip once)
+        for ni in range(neg_search_limit):
+            any_flag = False
+            for ex in range(n_examples):
+                if batch_neg_flags[ex, ni] == np.int32(1):
+                    any_flag = True
+                    break
+            if any_flag:
+                nl = neg_ids[ni]
+                rn = np.float32(0.0)
+                for d in range(dim):
+                    rn += emb[nl, d] * emb[nl, d]
+                rn = np.float32(np.sqrt(np.float64(rn)))
+                if rn > norm_limit:
+                    sc = norm_limit / rn
+                    for d in range(dim):
+                        emb[nl, d] *= sc
+
+    return loss_sum, rng_state
+
+
 # ── line offsets (for per-epoch shuffling) ────────────────────────────────────
 
 @njit(cache=True)
@@ -423,11 +662,15 @@ def _train_epoch(emb, adagrad_lhs, adagrad_rhs, buf, buf_len,
                  margin, neg_search_limit, start_rate, finish_rate,
                  rng_state, norm_limit, mode, ws,
                  line_offsets, n_lines, perm,
-                 max_neg_samples, neg_pool, neg_pool_size):
+                 max_neg_samples, neg_pool, neg_pool_size,
+                 batch_size):
     """One training epoch: shuffle lines, retokenise, train.
 
     LR schedule matches native C++: stepwise decay every 1000 samples
     from start_rate to finish_rate within the epoch.
+
+    batch_size: number of examples per batch (native default=5).
+    Examples in a batch share the same set of negative samples.
 
     Returns (loss_sum, n_steps, rng_state).
     """
@@ -458,9 +701,26 @@ def _train_epoch(emb, adagrad_lhs, adagrad_rhs, buf, buf_len,
     ctx_wids_tmp  = np.empty(MAX_TOK, np.int32)
     ctx_whash_tmp = np.empty(MAX_TOK, np.int32)
 
+    # batch scratch arrays (used when batch_size > 1)
+    BS = batch_size
+    batch_ctx    = np.empty((BS, max_ctx), np.int32)
+    batch_n_ctx  = np.empty(BS, np.int32)
+    batch_tgt    = np.empty((BS, MAX_TOK), np.int32)
+    batch_n_tgt  = np.empty(BS, np.int32)
+    batch_lhs    = np.empty((BS, dim), np.float32)
+    batch_rhs_pos = np.empty((BS, dim), np.float32)
+    rhs_neg      = np.empty(dim, np.float32)
+    batch_neg_mean = np.empty((BS, dim), np.float32)
+    batch_grad_w   = np.empty((BS, dim), np.float32)
+    neg_ids_b    = np.empty(neg_search_limit, np.int32)
+    batch_neg_flags = np.empty((BS, neg_search_limit), np.int32)
+    batch_n_valid = np.empty(BS, np.int32)
+    neg_vecs     = np.empty((neg_search_limit, dim), np.float32)
+    n_buffered   = np.int32(0)
+
+    # single-example scratch (used when batch_size == 1)
     lhs_vec   = np.empty(dim, np.float32)
     rhs_pos   = np.empty(dim, np.float32)
-    rhs_neg   = np.empty(dim, np.float32)
     neg_mean  = np.empty(dim, np.float32)
     grad_w    = np.empty(dim, np.float32)
     neg_ids   = np.empty(neg_search_limit, np.int32)
@@ -534,20 +794,49 @@ def _train_epoch(emb, adagrad_lhs, adagrad_rhs, buf, buf_len,
                     n_ctx = _build_word_ctx(
                         ctx_wids_tmp, ctx_whash_tmp, n_ctx_words,
                         word_ngrams, bucket, ngram_base, ctx_buf)
-                    target_buf[0] = line_wids[wi]
                     n_targets = np.int32(1)
 
-                    loss, rng_state = _train_step(
-                        emb, adagrad_lhs, adagrad_rhs,
-                        ctx_buf, n_ctx, target_buf, n_targets,
-                        lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
-                        neg_ids, neg_flags,
-                        dim, nwords, nlabels, margin,
-                        neg_search_limit,
-                        cur_lr, rng_state, norm_limit, mode,
-                        max_neg_samples, neg_pool, neg_pool_size)
-                    loss_sum += loss
-                    n_steps += 1
+                    if BS > 1:
+                        # buffer into batch
+                        bi = n_buffered
+                        for ci2 in range(n_ctx):
+                            batch_ctx[bi, ci2] = ctx_buf[ci2]
+                        batch_n_ctx[bi] = n_ctx
+                        batch_tgt[bi, 0] = line_wids[wi]
+                        batch_n_tgt[bi] = np.int32(1)
+                        n_buffered += 1
+
+                        if n_buffered >= BS:
+                            loss, rng_state = _train_batch(
+                                emb, adagrad_lhs, adagrad_rhs,
+                                batch_ctx, batch_n_ctx,
+                                batch_tgt, batch_n_tgt,
+                                n_buffered,
+                                batch_lhs, batch_rhs_pos, rhs_neg,
+                                batch_neg_mean, batch_grad_w,
+                                neg_ids_b, batch_neg_flags,
+                                batch_n_valid,
+                                dim, nwords, nlabels, margin,
+                                neg_search_limit,
+                                cur_lr, rng_state, norm_limit, mode,
+                                max_neg_samples, neg_pool,
+                                neg_pool_size, neg_vecs)
+                            loss_sum += loss
+                            n_steps += n_buffered
+                            n_buffered = np.int32(0)
+                    else:
+                        target_buf[0] = line_wids[wi]
+                        loss, rng_state = _train_step(
+                            emb, adagrad_lhs, adagrad_rhs,
+                            ctx_buf, n_ctx, target_buf, n_targets,
+                            lhs_vec, rhs_pos, rhs_neg, neg_mean,
+                            grad_w, neg_ids, neg_flags,
+                            dim, nwords, nlabels, margin,
+                            neg_search_limit,
+                            cur_lr, rng_state, norm_limit, mode,
+                            max_neg_samples, neg_pool, neg_pool_size)
+                        loss_sum += loss
+                        n_steps += 1
 
             # stepwise LR decay (count each line as one sample)
             sample_count += 1
@@ -647,22 +936,71 @@ def _train_epoch(emb, adagrad_lhs, adagrad_rhs, buf, buf_len,
             if do_train:
                 if cur_lr <= np.float32(0.0):
                     break
-                loss, rng_state = _train_step(
-                    emb, adagrad_lhs, adagrad_rhs,
-                    ctx_buf, n_ctx, target_buf, n_targets,
-                    lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
-                    neg_ids, neg_flags,
-                    dim, nwords, nlabels, margin,
-                    neg_search_limit,
-                    cur_lr, rng_state, norm_limit, mode,
-                    max_neg_samples, neg_pool, neg_pool_size)
-                loss_sum += loss
-                n_steps += 1
+                if BS > 1:
+                    # buffer into batch
+                    bi = n_buffered
+                    for ci2 in range(n_ctx):
+                        batch_ctx[bi, ci2] = ctx_buf[ci2]
+                    batch_n_ctx[bi] = n_ctx
+                    for ti in range(n_targets):
+                        batch_tgt[bi, ti] = target_buf[ti]
+                    batch_n_tgt[bi] = n_targets
+                    n_buffered += 1
+
+                    if n_buffered >= BS:
+                        loss, rng_state = _train_batch(
+                            emb, adagrad_lhs, adagrad_rhs,
+                            batch_ctx, batch_n_ctx,
+                            batch_tgt, batch_n_tgt,
+                            n_buffered,
+                            batch_lhs, batch_rhs_pos, rhs_neg,
+                            batch_neg_mean, batch_grad_w,
+                            neg_ids_b, batch_neg_flags,
+                            batch_n_valid,
+                            dim, nwords, nlabels, margin,
+                            neg_search_limit,
+                            cur_lr, rng_state, norm_limit, mode,
+                            max_neg_samples, neg_pool, neg_pool_size,
+                            neg_vecs)
+                        loss_sum += loss
+                        n_steps += n_buffered
+                        n_buffered = np.int32(0)
+                else:
+                    loss, rng_state = _train_step(
+                        emb, adagrad_lhs, adagrad_rhs,
+                        ctx_buf, n_ctx, target_buf, n_targets,
+                        lhs_vec, rhs_pos, rhs_neg, neg_mean, grad_w,
+                        neg_ids, neg_flags,
+                        dim, nwords, nlabels, margin,
+                        neg_search_limit,
+                        cur_lr, rng_state, norm_limit, mode,
+                        max_neg_samples, neg_pool, neg_pool_size)
+                    loss_sum += loss
+                    n_steps += 1
 
                 # stepwise LR decay every 1000 samples
                 sample_count += 1
                 if sample_count % K_DECR_STEP == 0:
                     cur_lr -= decr_per_k
+
+    # flush remaining buffered examples
+    if n_buffered > 0 and BS > 1:
+        loss, rng_state = _train_batch(
+            emb, adagrad_lhs, adagrad_rhs,
+            batch_ctx, batch_n_ctx,
+            batch_tgt, batch_n_tgt,
+            n_buffered,
+            batch_lhs, batch_rhs_pos, rhs_neg,
+            batch_neg_mean, batch_grad_w,
+            neg_ids_b, batch_neg_flags,
+            batch_n_valid,
+            dim, nwords, nlabels, margin,
+            neg_search_limit,
+            cur_lr, rng_state, norm_limit, mode,
+            max_neg_samples, neg_pool, neg_pool_size,
+            neg_vecs)
+        loss_sum += loss
+        n_steps += n_buffered
 
     return loss_sum, n_steps, rng_state
 
@@ -793,14 +1131,14 @@ class StarSpace:
     __slots__ = ("emb", "vocab", "dim", "word_ngrams", "margin",
                  "neg_search_limit", "lr", "epoch", "seed",
                  "norm_limit", "verbose", "train_mode", "ws",
-                 "max_neg_samples")
+                 "max_neg_samples", "batch_size")
 
     def __init__(self, *, vocab: Vocab, emb: np.ndarray,
                  dim: int, word_ngrams: int = 1, margin: float = 0.05,
                  neg_search_limit: int = 50, lr: float = 0.01,
                  epoch: int = 5, seed: int = 0, norm_limit: float = 1.0,
                  verbose: int = 2, train_mode: int = 0, ws: int = 5,
-                 max_neg_samples: int = 10):
+                 max_neg_samples: int = 10, batch_size: int = 5):
         self.vocab, self.emb = vocab, emb
         self.dim = dim
         self.word_ngrams = word_ngrams
@@ -812,6 +1150,7 @@ class StarSpace:
         self.train_mode = train_mode
         self.ws = ws
         self.max_neg_samples = max_neg_samples
+        self.batch_size = batch_size
 
     # ── prediction ────────────────────────────────────────────────────────
 
@@ -898,7 +1237,7 @@ class StarSpace:
             meta=np.array([self.dim, self.word_ngrams, self.epoch, self.seed,
                            self.vocab.ntokens, self.vocab.bucket,
                            self.neg_search_limit, self.train_mode, self.ws,
-                           self.max_neg_samples]),
+                           self.max_neg_samples, self.batch_size]),
             fmeta=np.array([self.lr, self.margin, self.norm_limit]),
             label_prefix=np.array([self.vocab.label_prefix]),
         )
@@ -928,6 +1267,7 @@ class StarSpace:
         train_mode = int(m[7]) if len(m) > 7 else 0
         ws = int(m[8]) if len(m) > 8 else 5
         max_neg_samples = int(m[9]) if len(m) > 9 else 10
+        batch_size_val = int(m[10]) if len(m) > 10 else 5
         return cls(
             vocab=vocab, emb=d["emb"],
             dim=int(m[0]), word_ngrams=int(m[1]),
@@ -937,6 +1277,7 @@ class StarSpace:
             norm_limit=float(fm[2]), verbose=2,
             train_mode=train_mode, ws=ws,
             max_neg_samples=max_neg_samples,
+            batch_size=batch_size_val,
         )
 
     # ── training (mmap pipeline, no intermediate arrays) ─────────────────
@@ -946,7 +1287,8 @@ class StarSpace:
               margin=0.05, neg_search_limit=50, min_count=1,
               word_ngrams=1, bucket=2_000_000, norm_limit=1.0,
               init_rand_sd=0.001, seed=0, verbose=2,
-              train_mode=0, ws=5, max_neg_samples=10) -> StarSpace:
+              train_mode=0, ws=5, max_neg_samples=10,
+              batch_size=5) -> StarSpace:
         """Train a StarSpace model.
 
         *data* is a file path (str) or an iterable of token lists.
@@ -966,7 +1308,8 @@ class StarSpace:
                     word_ngrams=word_ngrams, bucket=bucket,
                     norm_limit=norm_limit, init_rand_sd=init_rand_sd,
                     seed=seed, verbose=verbose, train_mode=train_mode, ws=ws,
-                    max_neg_samples=max_neg_samples)
+                    max_neg_samples=max_neg_samples,
+                    batch_size=batch_size)
             finally:
                 try:
                     os.unlink(tmp.name)
@@ -1058,7 +1401,8 @@ class StarSpace:
                     neg_search_limit=neg_search_limit,
                     lr=lr, epoch=epoch, seed=seed, norm_limit=norm_limit,
                     verbose=verbose, train_mode=train_mode, ws=ws,
-                    max_neg_samples=max_neg_samples)
+                    max_neg_samples=max_neg_samples,
+                    batch_size=batch_size)
 
         # train (retokenises from mmap each epoch)
         model._fit(buf, buf_len, ht_fnv, ht_occ, ht_tok_start, ht_tok_len,
@@ -1101,7 +1445,8 @@ class StarSpace:
                 rng_state, np.float32(self.norm_limit),
                 np.int32(self.train_mode), np.int32(self.ws),
                 line_offsets, n_lines, perm,
-                np.int32(self.max_neg_samples), neg_pool, neg_pool_size)
+                np.int32(self.max_neg_samples), neg_pool, neg_pool_size,
+                np.int32(self.batch_size))
 
             loss_acc += float(loss)
             n_acc += int(steps)
@@ -1143,6 +1488,7 @@ def _cli():
     tr.add_argument("--train-mode",       type=int,   default=0)
     tr.add_argument("--ws",               type=int,   default=5)
     tr.add_argument("--max-neg-samples",  type=int,   default=10)
+    tr.add_argument("--batch-size",       type=int,   default=5)
 
     ts = sub.add_parser("test")
     ts.add_argument("model")
@@ -1163,7 +1509,8 @@ def _cli():
             bucket=args.bucket, norm_limit=args.norm_limit,
             init_rand_sd=args.init_rand_sd, seed=args.seed,
             train_mode=args.train_mode, ws=args.ws,
-            max_neg_samples=args.max_neg_samples)
+            max_neg_samples=args.max_neg_samples,
+            batch_size=args.batch_size)
         m.save(args.output)
     elif args.cmd == "test":
         m = StarSpace.load(args.model)

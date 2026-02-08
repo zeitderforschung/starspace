@@ -14,7 +14,7 @@ make BOOST_DIR=/usr/include opt    # native C++ binary (for comparison)
 ```
 starspace.py              — Pure Python StarSpace (numpy + numba), all 6 modes
 test_starspace_modes.py   — Test suite (modes 0-5, file I/O, save/load)
-test_native_compare.py    — Cross-validation vs native C++ (modes 0-5)
+test_native_compare.py    — Cross-validation vs native C++ (16 tests, 65 checks)
 src/                      — Original C++ StarSpace source
 makefile                  — C++ build (use BOOST_DIR=/usr/include)
 ```
@@ -22,10 +22,11 @@ makefile                  — C++ build (use BOOST_DIR=/usr/include)
 ## Running Tests
 
 ```bash
-python3 test_starspace_modes.py
+python3 test_starspace_modes.py          # 8 tests: modes 0-5 + file + iter
+python3 test_native_compare.py           # 16 tests, 65 checks vs native C++
 ```
 
-All 8 tests must pass (modes 0-5, file input, iter_lines input).
+All 8 unit tests must pass. Native comparison: 65 checks expected to pass (warnings OK).
 
 ## Architecture: starspace.py
 
@@ -37,7 +38,7 @@ Training operates directly on a memory-mapped text file:
 
 2. **Pass 2** `_extract_vocab` (Python): Filters words by `min_count`, sorts by frequency descending, assigns final embedding IDs, builds remap array. Reconstructs Python strings from byte offsets for the `Vocab` dataclass.
 
-3. **Train** `_train_epoch` (Numba `@njit`): Retokenises from mmap each epoch — scans bytes, looks up tokens in hash table via `_lookup_token`, builds LHS context via `_build_word_ctx`, trains inline via `_train_step`. No intermediate arrays stored between passes.
+3. **Train** `_train_epoch` (Numba `@njit`): Retokenises from mmap each epoch — scans bytes, looks up tokens in hash table via `_lookup_token`, builds LHS context via `_build_word_ctx`, buffers examples into batches, trains via `_train_batch` (shared negatives across batch, matching native `trainOneBatch`). No intermediate arrays stored between passes.
 
 ### Key functions
 
@@ -48,7 +49,8 @@ Training operates directly on a memory-mapped text file:
 | `_lookup_token(buf, ...)` | `@njit` | Hash table lookup for one token → (id, fnv) |
 | `_build_word_ctx(wids, ...)` | `@njit` | Build LHS context: word IDs + n-gram buckets |
 | `_train_step(emb, ...)` | `@njit` | One hinge-loss + neg-sampling + AdaGrad step |
-| `_train_epoch(emb, ...)` | `@njit` | Scan mmap, tokenise, mode dispatch, call helpers |
+| `_train_batch(emb, ...)` | `@njit` | Batch training: shared negatives across batch (matches native `trainOneBatch`) |
+| `_train_epoch(emb, ...)` | `@njit` | Scan mmap, tokenise, mode dispatch, buffer batches, call helpers |
 | `_alloc_hash_table(n)` | Python | Allocate struct-of-arrays hash table |
 | `_extract_vocab(buf, ...)` | Python | Pass 2: hash table → Vocab + remap |
 
@@ -88,10 +90,11 @@ text mmap          0 B   OS pages from disk, not RAM
 hash table      570 MB   4 kept arrays × 33.5 M slots (fnv/occ/tok_start/tok_len)
 remap           134 MB   table_size × int32
 embeddings    2,800 MB   (5 M + labels + 2 M buckets) × 100 × float32
-adagrad          28 MB   n_emb × float32
+adagrad_lhs      28 MB   n_emb × float32 (separate LHS accumulator)
+adagrad_rhs      28 MB   n_emb × float32 (separate RHS accumulator)
 epoch scratch  ~320 KB   line buffers, ctx_buf, vectors (negligible)
 ─────────────────────
-total         ~3.5 GB    the text is never copied into RAM
+total         ~3.6 GB    the text is never copied into RAM
 ```
 
 ### API
@@ -108,15 +111,18 @@ model = StarSpace.load("model.npz")
 ### Native C++ alignment
 
 The Python implementation matches native C++ StarSpace behavior:
+- **Batch training**: `batch_size=5` (default), shared negatives across batch matching native `trainOneBatch`
+- **Separate AdaGrad**: LHS and RHS have independent accumulators (`adagrad_lhs`/`adagrad_rhs`), matching native `LHSUpdates_`/`RHSUpdates_`
 - **Gradient rates**: LHS AdaGrad uses `||gradW||²/dim`, RHS positive rate = `lr`, RHS negative rate = `lr/num_violated_negs`
 - **maxNegSamples cap**: Default 10, matching native `args_->maxNegSamples`
 - **LR schedule**: Stepwise decay every 1000 samples within each epoch, epoch-level decay from `lr` to ~1e-9
 - **Per-epoch line shuffling**: Fisher-Yates shuffle on line offsets
 - **Negative sampling**: Frequency-weighted pool (proportional to corpus frequency, matching native `getRandomRHS`/`getRandomWord`)
+- **Context window (mode 5)**: Exclusive right boundary `[max(0, i-ws), min(N, i+ws))` excluding center word, matching native
 
 Known differences from native:
-- **Batch size**: Native default 5 (shared negatives), Python uses 1 (per-example SGD)
 - **Mode 2 negatives**: Native returns multi-label negatives (all labels from random example minus one), Python samples single labels
+- **Vocab ordering**: Native uses unstable `std::sort`; tie-breaking for same-frequency words is undefined (word/label sets match, order may differ)
 
 ### Constraints
 

@@ -18,6 +18,7 @@ starspace.py              — Pure Python implementation (numpy + numba)
 test_starspace.py         — Self-consistency tests (determinism, convergence, API)
 test_starspace_native.py  — Native C++ comparison tests (all modes, parametrized)
 test_starspace_lastfm.py  — Last.FM tests (artist recommendation + tag co-occurrence)
+test_starspace_papers.py  — Paper recommendation (collaborative filtering + content)
 data/lastfm/              — Last.FM hetrec2011-2k dataset
 src/                      — Original C++ source
 ```
@@ -32,6 +33,8 @@ python3 -m pytest test_starspace.py test_starspace_native.py -q
 **test_starspace.py** tests determinism, save/load roundtrip, convergence for all 5 modes, and API surface (predict, file input, iterable input).
 
 **test_starspace_native.py** compares vocabulary, embedding norms, P@1, and semantic predictions (both Python and native) against the native C++ binary on real data (tagged_post.txt). Parametrized over all 5 modes.
+
+**test_starspace_papers.py** trains mode 1 on paper co-occurrence data from `~/work/data/papers/`. Three co-occurrence sources: (user, collection) groups, project source groups, and user-level library groups. Single-paper lines for all 223K papers ensure full library coverage. Features: title words, AU_-prefixed author names, J_-prefixed journal tokens. Evaluation: collaborative filtering holdout, content-based retrieval, project leave-one-out, and per-source-voting novel recommendations.
 
 ## Code Quality
 
